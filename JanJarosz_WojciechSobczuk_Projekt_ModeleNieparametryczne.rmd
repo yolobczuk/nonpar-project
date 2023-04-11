@@ -1,0 +1,1595 @@
+---
+title: "Projekt z przedmiotu Modele Nieparametryczne"
+authors: "Jan Jarosz, Wojciech Sobczuk"
+output:
+  html_document:
+    code_folding: hide
+date: "2023-01-29"
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1800px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+```{r libraries, include=FALSE}
+library(tidyr)
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(ggplot2)
+library(kableExtra)
+
+library(rpart)
+library(rpart.plot)
+library(tree)
+library(adabag)
+library(randomForestSRC)
+library(randomForest)
+library(earth)
+library(gbm)
+library(caret)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+# Opis projektu
+
+Dane projektowe dotyczą transakcji kartowych, z podziałem na transakcje inicjalizujące oraz rekurencyjne. Pochodzą one z przełomu 2020 i 2021 roku (8.07.2020-7.07.2021). Celem projektu jest wykonanie dwóch zadań:
+
+-   Zbudowanie modelu predykcyjnego dla zmiennej wskazującej czy transakcja rekurencyjna jest udana,
+-   Zbudowanie modelu predykcyjnego dla zmiennej odpowiadającej za kwotę transakcji/przelewu dla transakcji rekurencyjnych,
+
+```{r load_data, include = FALSE}
+set.seed(1234)
+load("dane_zaliczenie.RData")
+```
+
+# Wstępna analiza eksploracyjna oraz wzbogacanie danych
+
+Projekt ten rozpoczniemy od wstępnej eksploracji danych, na podstawie zbioru uczącego (struktura zbioru testowego jest taka sama, ma on mniej obserwacji - 15185 wartości). Analizę eksploracyjną rozpoczniemy od opisu zmiennych, posiłkując się dołączonym do zadania projektowego plikiem.
+
+-   zmienna `id` odpowiada za identyfikator transakcji,
+-   zmienna `initialtransaction_id` odpowiada za identyfikator transakcji inicjalizującej,
+-   zmienna `createtime` oznacza datę i czas utworzenia transakcji,
+-   zmienna `amount` to kwota przelewu (w pierwszym zadaniu posłuży jako zmienna objaśniająca, w drugim jako zmienna objaśniana),
+-   zmienna `browseragent` oznacza przeglądarkę klienta, z której wykonano transakcję,
+-   zmienna `description` to tytuł przelewu
+-   zmienna `recurringaction` da nam informację o rodzaju płatności rekurencyjnej, wartości inne niż `AUTO` lub `MANUAL` oznaczać będą transakcję inicjalizującą,
+-   zmienne `screenheight` oraz `screenwidth` oznaczają kolejno wysokość i szerokość ekranu urządzenia klienta, z którego dokonał transakcji,
+-   zmienna `acquirerconnectionmethod` to zmienna techniczna oznaczająca sposób łączenia się klienta z systemem transakcyjnym,
+-   zmienne `expirymonth` oraz `expiryyear` oznaczają kolejno miesiąc i rok wygaśnięcia karty kredytowej,
+-   zmienne `issuer`, `type`, `level` oraz `countrycode` to kolejne zmienne dotyczące parametrów kart kredytowych - kolejno: wystawca, rodzaj, klasa oraz kraj wydania,
+-   zmienne `listtype` oraz `mccname` dotyczą sektora i nazwy branży działania partnera,
+-   zmienna `payclickedtime` data i czas potwierdzenia transakcji,
+-   zmienna `status`, która znajduje się jedynie w zbiorze danych uczących i dotyczy statusu płatności. Płatność uznajemy za pomyślną gdy ta zmienna ma wartość `completed successfully` lub płatność jest transakcją inicjalizującą.
+
+Poniżej znajduje się podsumowanie wszystkich wymienionych wcześniej zmiennych.
+
+```{r}
+summary(proba_uczaca)
+```
+
+Z powyższego podsumowania oraz ze specyfiki zmiennych wynika, że większość z nich jest typu kategorycznego. Oznacza to, że estymowane przez nas modele nie będą parametryczne. Posłużymy się więc modelami nieparametrycznymi. Większość zmiennych kategorycznych została błędnie zinterpretowana jako zmienne tekstowe. Należy je więc przekonwertować na zmienne typu `factor`. Dodatkowo, przeprowadzimy proces wzbogacania danych o zmienne, które naszym zdaniem mogą okazać się pomocne w lepszym oszacowaniu modeli predykcyjnych.
+
+```{r}
+proba_uczaca = proba_uczaca %>% mutate(browseragent = as.factor(word(browseragent,1)),
+                                       recurringaction = as.factor(recurringaction),
+                                       screenheight = as.numeric(screenheight),
+                                       screenwidth= as.numeric(screenwidth),
+                                       acquirerconnectionmethod = as.factor(acquirerconnectionmethod),
+                                       issuer = as.factor(issuer), type = as.factor(type),
+                                       level = as.factor(level), countrycode = as.factor(countrycode),
+                                       listtype = as.factor(listtype), mccname = as.factor(mccname),
+                                       createdate = date(createtime),
+                                       expirydate = my(paste(expirymonth,
+                                                             expiryyear, sep ='/')),
+                                       expiryquarter = as.factor(paste('Q',quarter(expirydate),sep = '')),
+                                       expirydiff = as.numeric(expirydate-createdate),
+                                       createwdate = wday(createdate),
+                                       isrecurring = ifelse((recurringaction=="AUTO" | recurringaction=="MANUAL") , T, F),
+                                       createquarter = as.factor(paste('Q',quarter(createdate),sep = '')),
+                                       createmonth = month(createdate),
+                                       resolution = as.factor(paste(screenheight,screenwidth,sep = 'x')),
+                                       target = as.factor(ifelse(status=="completed successfully" | !isrecurring, 1, 0)))
+
+proba_testowa = proba_testowa %>% mutate(browseragent = as.factor(word(browseragent,1)),
+                                         recurringaction = as.factor(recurringaction),
+                                         screenheight = as.factor(as.numeric(screenheight)),
+                                         screenwidth= as.factor(as.numeric(screenwidth)),
+                                         acquirerconnectionmethod = as.factor(acquirerconnectionmethod),
+                                         issuer = as.factor(issuer),
+                                         type = as.factor(type),
+                                         level = as.factor(level),
+                                         countrycode = as.factor(countrycode),
+                                         listtype = as.factor(listtype),
+                                         mccname = as.factor(mccname),
+                                         createdate = date(createtime),
+                                         expirydate = my(paste(expirymonth, expiryyear, sep ='/')),
+                                         expiryquarter = as.factor(paste('Q',quarter(expirydate),sep = '')),
+                                         createmonth = month(createdate),
+                                         expirydiff = as.numeric(expirydate-createdate),
+                                         createwdate = wday(createdate),
+                                         isrecurring = ifelse((recurringaction=="AUTO" | recurringaction=="MANUAL"), T, F),
+                                         createquarter = as.factor(paste('Q',quarter(createdate),sep = '')),
+                                         resolution = as.factor(paste(screenheight,screenwidth,sep = 'x')))
+```
+
+Zbiór danych został wzbogacony o następujące zmienne:
+
+-   `expirydate` - łącząca informacje przenoszone przez zmienne `expirymonth` i `expiryyear`, tworząca datę wygaśnięcia karty,
+-   `expiryquarter` - rozszerzająca informacje podane przez dwie wymienione wcześniej zmienne o kwartał wygaśnięcia karty,
+-   `expirydiff` - wyliczająca liczbę dni do wygaśnięcia karty od daty wyznaczonej przez zmienną `createtime` odpowiadającą za moment utworzenia transakcji,
+-   `createwdate` - rozszerzająca informację o dacie utworzenia transakcji poprzez dołączenie dnia tygodnia rozpoczęcia transakcji,
+-   `createquarter` - rozszerzająca informację o dacie utworzenia transakcji poprzez dołączenie kwartału rozpoczęcia transakcji,
+-   `createmonth` - rozszerzająca informację o dacie utworzenia transakcji poprzez dołączenie miesiąca rozpoczęcia transakcji,
+-   `resolution` - łącząca informacje dotyczące parametrów rozdzielczości ekranu, z którego dokonywana była transakcja,
+-   `target` - zmienna objaśniana, mówiąca czy transakcja była udana czy nie.
+
+Dodane zostały również dwie techniczne zmienne, które nie będą wchodziły w skład predyktorów, a stworzone zostały w celu ułatwienia operacji na danych - `createdate` oraz `isrecurring`, które odpowiadają za wyodrębnienie daty ze znacznika czasowego zmiennej `createtime` oraz za oznaczenie, czy dana transakcja jest rekurencyjna na podstawie informacji zawartych w zmiennej `recurringaction`.
+
+Ta ostatnia okaże się przydatna do filtrowania bazy danych. Dołączymy bowiem do wyjściowego zbioru danych informacje dotyczące transakcji inicjującej dla danej transakcji (z sufiksem `.init`), aby zwiększyć liczbę potencjalnych predyktorów.
+
+```{r}
+initial_trans_uczaca = proba_uczaca %>% filter(isrecurring==F)
+initial_trans_testowa = proba_testowa %>% filter(isrecurring==F)
+
+proba_uczaca_merged = merge(proba_uczaca, initial_trans_uczaca, by.x = 'initialtransaction_id', by.y = 'id', all.x = T, suffixes = c('','.init')) %>% dplyr::select(-c(listtype.init, recurringaction.init, description.init, description, mccname.init, status.init, isrecurring.init, initialtransaction_id.init, target.init, initialtransaction_id, id, createtime, payclickedtime, createtime.init, payclickedtime.init, createdate, createdate.init, expirydate, expirydate.init, screenwidth, screenheight, browseragent, resolution)) %>% filter(isrecurring)
+
+proba_testowa_merged = merge(proba_testowa, initial_trans_testowa, by.x = 'initialtransaction_id', by.y = 'id', all.x = T, suffixes = c('','.init')) %>% dplyr::select(-c(listtype.init, recurringaction.init, description.init, description, mccname.init, isrecurring.init, initialtransaction_id.init, initialtransaction_id, createtime, payclickedtime, createtime.init, payclickedtime.init, createdate, createdate.init, expirydate, expirydate.init, screenwidth, screenheight, browseragent, resolution)) %>% filter(isrecurring)
+```
+
+Dokonując operacji łączenia danych, usunęliśmy również niektóre zmienne (głównie ze zbioru z transakcjami inicjalizującymi). Z głównego zbioru danych usunęliśmy zmienne odpowiadające między innymi za tytuł transakcji, identyfikator transakcji, identyfikator transakcji inicującej, znacznik czasu oraz data stworzenia transakcji, znacznik czasu potwierdzenia transakcji oraz data wygaśnięcia karty wraz z odpowiadającymi im zmiennymi dotyczącymi transakcji inicjujących. Zdecydowaliśmy się na taki ruch, ze względu na fakt, że są to zmienne, z których ciężko wydostać przydatne dane lub zostały przekonwertowane do bardziej 'przyjaznej' formy.
+
+Ze zbioru transakcji inicjalizujących usunęliśmy dodatkowo zmienne `listtype.init`, `recurringaction.init`, `description.init`, `mccname.init`, `isrecurring.init`, `screenheight`, `resolution`, `screenwidth` oraz `target.init` ze względu na występowaniu 100% braków danych (niektóre zmienne nie mają interpretacji w przypadku transakcji inicjalizujących) lub niską zdolność predykcyjną (taką jak na przykład tytuł transakcji inicjalizującej). Poniżej zostało umieszczone ostateczne podsumowanie zbioru danych. W zbiorze danych pozostała zmienna `amount`, jednak nie będzie ona brana pod uwagę w tym zadaniu gdyż ma ona braki danych w zbiorze testowym, przez co nie będzie możliwe dokonanie predykcji na tych danych. Odfiltrowane zostały również obserwacje będące transakcjami inicjalizującymi, jako że zadania dotyczą jedynie transakcji rekurencyjnych.
+
+```{r}
+summary(proba_uczaca_merged)
+```
+
+Ponad 25 tysięcy rekordów w zbiorze uczącym to transacje rekurencyjne. Wyróżnić można dwóch głownych wydawców karty (VISA oraz MASTERCARD) oraz dwie głowne klasy kart (CLASSIC i STANDARD). Najpopularniejsze były karty debetowe. Większość kart została wydana w Polsce. Główne kategorie przedsiębiorstw to te pochodzące z kategorii ECOMMERCE i są to najczęściej usługi biznesowe gdzie indziej nie sklasyfikowane. Ponad 20 tysięcy transakcji zakończyło się pomyślnie. Kwartał wygaśnięcia karty i utworzenia transakcji oraz rozdzielczość ekranu, z którego dokonana została transakcja rozkłada się mniej więcej równomiernie między wszystkimi kategoriami. Warto również zaznaczyć, że w zbiorze danych jest `r sum(proba_uczaca_merged$expirydiff.init<0)` pozycji o ujemnej wartości zmiennej `expirydiff` co oznacza, że karty użyte przez tych użytkowników wygasły.
+
+Dla danych dotyczących transakcji inicjujących rozkłady danych w kategoriach wyglądają bardzo podobnie. Poniżej umieścimy jeszcze dwa wykresy rozrzutu zmiennych numerycznych.
+
+```{r}
+proba_uczaca_plot_hist = proba_uczaca_merged %>% dplyr::select(c(expirydiff, amount.init, screenheight.init, screenwidth.init, expirydiff.init))
+
+plot1 <- ggplot(gather(proba_uczaca_plot_hist), aes(x = value)) +  
+  geom_histogram(colour = 1, fill = "blue", bins = 30)+
+  ggtitle("Rozkłady zmiennych zbioru danych")+
+  ylab("Częstość występowania")+
+  xlab("Wartość zmiennej")+
+  facet_wrap(~ key, scales = "free", ncol = 2)
+plot1
+
+proba_uczaca_plot_bar = proba_uczaca_merged %>% dplyr::select(c(expirymonth, expiryyear, createwdate, expirymonth.init, expiryyear.init, createwdate.init))
+
+plot2 <- ggplot(gather(proba_uczaca_plot_bar), aes(x = value)) +  
+  geom_bar(colour = 1, fill = "blue")+
+  ggtitle("Rozkłady zmiennych zbioru danych")+
+  ylab("Częstość występowania")+
+  xlab("Wartość zmiennej")+
+  facet_wrap(~ key, scales = "free", ncol = 2) + scale_x_continuous(breaks = c(2, 4, 6, 8, 10, 12, 2020, 2022, 2024, 2026, 2028, 2030))
+plot2
+```
+
+Porównując rozkłady między wartościami dla transakcji i odpowiadającymi im transakcjami inicującymi, nie widać znaczącej różnicy w ich kształcie. Największą z nich jest duży peak w okolicach 1500 dnia do wygaśnięcia karty.
+
+Dla zmiennej `amount.init` zauważyć można, że wartości są skupione blisko zera co sugeruje niskie wartości transakcji. Zmienna `expirydiff` ma rozkład przypominający kształtem mocno spłaszczoną krzywą dzwonową z kilkoma wartościami odstającymi z prawej strony rozkładu. Zmienne odpowiadające za parametry techniczne urządzenia z którego rozpoczynana była transakcja skupiają się wokół wartości 750 dla wysokości ekranu oraz 0 dla szerokości ekranu (tutaj jednak ze wskazaniem na występowanie stosunkowo dużej ilości wartości odstających).
+
+Zmienna odpowiedzialna za przechowywanie informacji o dniu tygodnia, w którym rozpoczęta została transakcja rozkłada się równomiernie, ze wskazaniem na mniejsze występowanie poniedziałków oraz niedziel. Podobnie sytuacja wygląda dla zmiennej `expirymonth`, tutaj jednak można zaobserwować nieco wyższe wartości dla lutego oraz sierpnia oraz niższe dla kwietnia oraz grudnia. Zmienna odpowiedzialna za przechowywanie informacji o roku wygaśnięcia karty ma rozkład podobny do normalnego, z największymi wartościami w latach 2023 i 2024.
+
+Rozkłady dla wariantów zmiennych dotyczących transakcji inicjujących są bardzo podobne.
+
+Ostatnim krokiem będzie wyznaczenie próby walidacyjnej z wyjściowej próby uczącej - będzie to 30% rekordów.
+
+```{r}
+rm(proba_uczaca_plot_hist, proba_uczaca_plot_bar, plot1, plot2)
+
+grupy <- sample(rep(c("ucząca","walidacyjna"), round(c(0.7,0.3)*nrow(proba_uczaca_merged))))
+
+dane.uczaca <- proba_uczaca_merged[grupy=='ucząca',]
+dane.walidacyjna <- proba_uczaca_merged[grupy=='walidacyjna',]
+```
+
+Tym akcentem zakończyliśmy wstępną analizę eksploracyjną oraz przygotowanie danych i przejdziemy do wykonania pierwszego zadania, które ma na celu zbudowanie modelu predykcyjnego dla zmiennej wskazującej czy transakcja rekurencyjna jest udana.
+
+# Zadanie 1
+
+## Klasyczne drzewa klasyfikacyjne
+
+Proces tworzenia modeli predykcyjnych rozpoczniemy od drzew klasyfikacyjnych. Pierwszym stworzonym modelem będzie model zawierający wszystkie zmienne. Nie będzie on służył do samej predykcji, ale do wyznaczenia ważności zmiennych. Wyliczana ona jest jako suma ocen dobroci podziału w węzłach, gdzie występowała jako zmienna podziału i sumy ocen dobroci podziału razy korekta zgodności dla węzłów, gdzie występowała jako zmienna zastępcza (zmienne zastępcze używane są do kierowania obserwacji w dół drzewa w przypadku występowania braków danych). Ta miara posłuży potem do doboru zmiennych do estymowania kolejnych modeli. Wszystkie drzewa zostaną zainicjowane wartością `cp` (czyli complexity parameter) na 0. Ten parametr odpowiada za pomijanie podziału drzewa, które nie poprawiają znacząco jakości predykcji. Wartość statystyki $R^2$ musi wzrosnąć o więcej niż `cp`, aby podział nie został pominięty. Ustalając ten parametr na 0 nie pomijamy żadnego z podziałów.
+
+Jest to przydatne dlatego, że w następnym kroku wyznaczamy błąd sprawdzania krzyżowego. Polega ono na podziale zbioru uczącego na pewną liczbę `x` podzbiorów i wyznaczanie (w tym przypadku) drzew klasyfikacyjnych o identyfikatorach `i` od 1 do `x`, gdzie `i`-ty podzbiór jest traktowany jako zbiór testowy. Błąd klasyfikacji jest wyliczany jako średnia arytmetyczna błędów cząstkowych.
+
+Wybierana jest wartość parametru `cp` spośród wszystkich, dla których ten błąd jest najmniejszy. Związane to jest z tak zwaną zasadą jednego błędu standardowego wedle której, w procedurze przycinania wybieramy drzewo, którego błąd w sprawdzaniu krzyżowym jest większy od minimalnego błędu o nie więcej niż jedno odchylenie standardowe. Musimy również uważać na zjawisko przeuczenia, czyli sytuację w której zbyt skomplikowany model dobrze dopasowuje się do danych uczących ale gorzej do danych walidacyjnych czy testowych. Będziemy zatem starali się ograniczać liczbę dobieranych zmiennych przy zachowaniu wysokiej dokładności oraz wartości miary F.
+
+Dokładność to stosunek trafionych predykcji na zbiorze walidacyjnym do wielkości zbioru walidacyjnego, czyli opisuje on odsetek prawidłowo zakwalifikowanych wartości, na podstawie wyestymowanego modelu. Miara F natomiast jest wyliczana jako średnia harmoniczna precyzji oraz czułości. Precyzja mówi o odsetku dobrze zakwalifikowanych pozytywnych obserwacji ze wszystkich przewidywanych pozytywnych wartości. Czułość mówi o odsetku dobrze zakwalifikowanych pozytywnych obserwacji ze wszystkich prawdziwych pozytywnych obserwacji. Miara F łączy te dwie informacje i daje większy wgląd w specyfikę predykcji. Wysokie wartości tej miary oznaczają wysoką czułość oraz precyzję, niskie wartości oznaczają niskie wartości obu z nich, a wartości w okolicach 0.3-0.7 mogą oznaczać kształtowanie się obu miar składowych na podobnie średnim poziomie lub świadczy o wysokiej wartości jednej z nich i niskiej drugiej z nich. Miara F przydaje się również w zbiorach danych o niezbalansowanej strukturze, czyli o mocno różniącej się liczbie występujących wartości pozytywnych i negatywnych. Zbiór danych na którym pracujemy jest przykładem niezbalansowanego zbioru - wartości `1` zmiennej objaśnianej `target` jest prawie 5 razy więcej niż wartości `0`. Dlatego też miara ta będzie używana do sprawdzenia jakości modeli.
+
+Poniżej znajduje się zestawienie zmiennych wraz z odpowiadającymi im wartościami ważności w modelu.
+
+### Model z ważnościami
+
+```{r}
+rm(grupy)
+
+do_modelu = dane.uczaca %>% dplyr::select(-c(status,isrecurring,amount))
+
+initial.model <- rpart(target~., data = do_modelu, control = rpart.control(cp = 0))
+
+nr.min.cp <- which.min(initial.model$cptable[, "xerror"])
+blad.std <- sum(initial.model$cptable[nr.min.cp, c("xerror", "xstd")])
+optymalny.cp <- which(initial.model$cptable[, "xerror"] < blad.std)[1]
+
+initial.model.p <- prune(initial.model, cp = initial.model$cptable[optymalny.cp, "CP"])
+
+knitr::kable(initial.model.p$variable.importance, caption = 'Ważność zmiennych')
+```
+
+Najważniejszymi zmiennymi okazują się być `expirydiff.init`, `resolution.init`  oraz `expirydiff`. Dołączenie tych zmiennych do modelu znacząco poprawi jego jakość. Pierwszy stworzony przez nas model predykcyjny nie będzie jednak dotyczyć tych zmiennych. Początkowy model stworzymy na podstawie zmiennych, które naszym zdaniem mogą stworzyć dobry model. Będą to zmienne łatwo intepretowalne - `expirydiff`, `expirydiff.init`, `amount.init` oraz `level`. Nasze rozumowanie jest następujące:
+
+-   Jeśli klient ma nieważną kartę (czyli o wartościach `expirydiff` lub `expirydiff.init` mniejszych od 0), to na pewno transakcja nie będzie udana,
+-   Jeśli klient ma nowo wydaną kartę (czyli o dużych wartościach zmiennej `expirydiff` lub `expirydiff.init`), może się okazać, że nie zdążył zasilić jej odpowiednimi środkami i transakcja zostanie odrzucona. Mamy jednak pewność, że dla dodatnich wartości tych zmiennych transakcja nie zostanie odrzucona przez fakt posiadania nieważnej karty,
+-   Klienci posiadający karty 'wyższego' typu (np. biznesowego czy złotego) powinni rzadziej mieć odrzucane transakcje ze względu na brak środków na koncie.
+
+Rozważaliśmy również dołączenie zmiennej `type`, ale jej niska ważność spowodowała, że zdecydowaliśmy na nie dołączanie jej do inicjalnego modelu.
+
+Poniżej znajduje się kod odpowiedzialny za implementację tego modelu. Pierwszy model został stworzony bez przycinania, z domyślną wartością `cp`.
+
+### Model z dobranymi indywidualnie zmiennymi, bez przycięcia
+
+```{r}
+measures.df <- data.frame(matrix(ncol = 1, nrow = 4))
+i=1
+rownames(measures.df) <- c('Dokładność', 'Precyzja', 'Czułość', 'Miara F')
+
+model.1 <- rpart(target~expirydiff.init+expirydiff+amount.init+level, data = do_modelu)
+
+predykcja <- predict(object = model.1, newdata = dane.walidacyjna, type = "class")
+
+t = table(Rzeczywiste = dane.walidacyjna$target, Przewidywane = predykcja)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja == dane.walidacyjna$target) / nrow(dane.walidacyjna)
+
+predykcjaak <- predict(object = model.1, newdata = do_modelu, type = "class")
+acc.ucz <- sum(predykcjaak == do_modelu$target) / nrow(do_modelu)
+
+f = 2*(prec*rec)/(prec+rec)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'Klas. mod. 1.'
+
+i=i+1
+```
+
+Dokładność tego modelu dla zbioru walidacyjnego wyniosła `r acc` (dla zbioru uczącego wyniosła ona `r acc.ucz`, więc nie widać dużej różnicy mogącej świadczyć o przeuczeniu modelu), a wartość miary F `r f`. Dokładność modelu jest na bardzo zadowalającym poziomie, jednakże wartość miary F jest zdecydowanie zbyt niska - czułość kształtuje się na poziomie około 0.65, a precyzja na poziomie około 0.1. Dlatego też wymagane jest przeprowadzenie procedury przycinania drzewa, aby zwiększyć wartość tej statystyki, czyli zredukować liczbę nietrafionych predykcji i możliwe je zbalansować.
+
+### Model z dobranymi indywidualnie zmiennymi, z przycięciem
+
+```{r}
+rm(model.1)
+model.1a <- rpart(target~expirydiff.init+expirydiff+amount.init+level, data = do_modelu, control = rpart.control(cp = 0))
+
+nr.min.cp <- which.min(model.1a$cptable[, "xerror"])
+blad.std <- sum(model.1a$cptable[nr.min.cp, c("xerror", "xstd")])
+optymalny.cp <- which(model.1a$cptable[, "xerror"] < blad.std)[1]
+
+model.1a.p <- prune(model.1a, cp = model.1a$cptable[optymalny.cp, "CP"])
+
+predykcja <- predict(object = model.1a.p, newdata = dane.walidacyjna, type = "class")
+
+t = table(Rzeczywiste = dane.walidacyjna$target, Przewidywane = predykcja)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja == dane.walidacyjna$target) / nrow(dane.walidacyjna)
+
+f = 2*(prec*rec)/(prec+rec)
+
+predykcjaak <- predict(object = model.1a.p, newdata = do_modelu, type = "class")
+acc.ucz <- sum(predykcjaak == do_modelu$target) / nrow(do_modelu)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'Klas. mod. wybrane'
+
+i=i+1
+```
+
+Dokładność modelu pierwszego z przycinaniem dla zbioru walidacyjnego wyniosła `r acc` (dla zbioru uczącego `r acc.ucz`), a wartość miary F `r f`. Tutaj zaobserować już można znacznie większą wartość miary F, jednakże nie kształtuje się ona na satysfakcjonującym poziomie (występuje dość wysoka czułość i trochę niższa wartość precyzji). Zanim przejdziemy do intepretacji modelu, wyestymujemy kilka modeli, bazując na wcześniej wyznaczonych ważnościach zmiennych. Drugi z wyestymowanych modeli będzie zawierał zmienne o wartości ważności większej od 300, czyli `resolution.init`, `expirydiff` oraz `expirydiff.init`.
+
+### Model 1 z dobranymi zmiennymi przez współczynnik ważności, z przycięciem
+
+```{r}
+model.2 <- rpart(target~resolution.init+expirydiff.init+expirydiff, data = do_modelu, control = rpart.control(cp = 0))
+
+nr.min.cp <- which.min(model.2$cptable[, "xerror"])
+blad.std <- sum(model.2$cptable[nr.min.cp, c("xerror", "xstd")])
+optymalny.cp <- which(model.2$cptable[, "xerror"] < blad.std)[1]
+
+model.2.p <- prune(model.2, cp = model.2$cptable[optymalny.cp, "CP"])
+
+predykcja <- predict(object = model.2.p, newdata = dane.walidacyjna, type = "class")
+
+t = table(Rzeczywiste = dane.walidacyjna$target, Przewidywane = predykcja)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja == dane.walidacyjna$target) / nrow(dane.walidacyjna)
+
+predykcjaak <- predict(object = model.2.p, newdata = do_modelu, type = "class")
+acc.ucz <- sum(predykcjaak == do_modelu$target) / nrow(do_modelu)
+
+f = 2*(prec*rec)/(prec+rec)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'Klas. mod. 2.'
+
+i=i+1
+```
+
+Dokładność tego modelu dla zbioru walidacyjnego wyniosła `r acc` (dla zbioru uczącego `r acc.ucz`), a wartość miary F `r f`. Model ten pogorszył się w stosunku do modelu przez nas wybranego. Do trzeciego modelu dodane zostaną zmienne `expiryyear`, `expiryyear.init`, `createmonth.init`, `createmonth`, `browseragent.init` oraz `level`.
+
+### Model 2 z dobranymi zmiennymi przez współczynnik ważności, z przycięciem
+
+```{r}
+rm(model.2)
+rm(model.2.p)
+model.3 <- rpart(target~resolution.init+expirydiff.init+expirydiff+createmonth+createmonth.init+browseragent.init+level+expiryyear+expiryyear.init, data = do_modelu, control = rpart.control(cp = 0))
+
+nr.min.cp <- which.min(model.3$cptable[, "xerror"])
+blad.std <- sum(model.3$cptable[nr.min.cp, c("xerror", "xstd")])
+optymalny.cp <- which(model.3$cptable[, "xerror"] < blad.std)[1]
+
+model.3.p <- prune(model.3, cp = model.3$cptable[optymalny.cp, "CP"])
+
+predykcja <- predict(object = model.3.p, newdata = dane.walidacyjna, type = "class")
+
+t = table(Rzeczywiste = dane.walidacyjna$target, Przewidywane = predykcja)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja == dane.walidacyjna$target) / nrow(dane.walidacyjna)
+
+f = 2*(prec*rec)/(prec+rec)
+
+predykcjaak <- predict(object = model.3.p, newdata = do_modelu, type = "class")
+acc.ucz <- sum(predykcjaak == do_modelu$target) / nrow(do_modelu)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'Klas. mod. 3.'
+
+i=i+1
+```
+
+Dokładność dla zbioru walidacyjnego wyniosła `r acc` (dla zbioru uczącego wyniosła `r acc.ucz`), a wartość miary F `r f`. Oba parametry stosunkowo mocno poprawiły się względem poprzedniego modelu, jednak pozostają na podobnym poziomie co wartości dla modelu ze zmiennymi wybranymi przez nas. Ze względu na fakt, że dokładanie zmiennych nie poprawia znacząco wartości miar, a wpływa to negatywnie na wielkość drzewa, dokonamy ostatniej imputacji zmiennych - dodana zostanie zmienna `expirymonth`.
+
+### Model 3 z dobranymi zmiennymi przez współczynnik ważności, z przycięciem
+
+```{r}
+rm(model.3)
+rm(model.3.p)
+model.4 <- rpart(target~resolution.init+expirydiff.init+expirydiff+createmonth+createmonth.init+browseragent.init+level+expiryyear+expiryyear.init, data = do_modelu, control = rpart.control(cp = 0))
+
+nr.min.cp <- which.min(model.4$cptable[, "xerror"])
+blad.std <- sum(model.4$cptable[nr.min.cp, c("xerror", "xstd")])
+optymalny.cp <- which(model.4$cptable[, "xerror"] < blad.std)[1]
+
+model.4.p <- prune(model.4, cp = model.4$cptable[optymalny.cp, "CP"])
+
+predykcja <- predict(object = model.4.p, newdata = dane.walidacyjna, type = "class")
+
+t = table(Rzeczywiste = dane.walidacyjna$target, Przewidywane = predykcja)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja == dane.walidacyjna$target) / nrow(dane.walidacyjna)
+
+f = 2*(prec*rec)/(prec+rec)
+
+predykcjaak <- predict(object = model.4.p, newdata = do_modelu, type = "class")
+acc.ucz <- sum(predykcjaak == do_modelu$target) / nrow(do_modelu)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'Klas. mod. 4.'
+
+i=i+1
+```
+
+Dokładność modelu trzeciego wyniosła `r acc` (`r acc.ucz` dla zbioru uczącego), a wartość miary F `r f`. Tutaj różnica względem pierwszego (z dobranymi przez nas zmiennymi) modelu znów jest niewielka. Dlatego też zdecydowaliśmy się na porzucenie tego modelu. W celu poprawienia jakości pierwszego modelu (czyli tego ze zmiennymi dobranymi przez nas), spróbujemy dodać mechanizm kosztów, który penalizuje poszczególne błędne predykcje. Liczymy, że spowoduje to poprawę dokładności i wartości miary F.
+
+### Model 1 z dobranymi indywidualnie zmiennymi, z przycięciem oraz kosztami
+
+```{r}
+koszty <- matrix(c(0, 3, 4, 0), 2, 2, 
+                 dimnames = list(Rzeczywiste = c("0", "1"), 
+                                 Prognozowane = c("0", "1")))
+
+knitr::kable(koszty, caption = 'Tabela kontyngencji dla kosztów')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+model.1a.k <- rpart(target~expirydiff.init+expirydiff+level+amount.init, data = do_modelu, control = rpart.control(cp = 0), parms = list(loss = koszty))
+
+nr.min.cp <- which.min(model.1a.k$cptable[, "xerror"])
+blad.std <- sum(model.1a.k$cptable[nr.min.cp, c("xerror", "xstd")])
+optymalny.cp <- which(model.1a.k$cptable[, "xerror"] < blad.std)[1]
+
+model.1a.k.p <- prune(model.1a.k, cp = model.1a$cptable[optymalny.cp, "CP"])
+
+predykcja <- predict(object = model.1a.k.p, newdata = dane.walidacyjna, type = "class")
+
+t = table(Rzeczywiste = dane.walidacyjna$target, Przewidywane = predykcja)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja == dane.walidacyjna$target) / nrow(dane.walidacyjna)
+
+predykcjaak <- predict(object = model.1a.k.p, newdata = do_modelu, type = "class")
+acc.ucz <- sum(predykcjaak == do_modelu$target) / nrow(do_modelu)
+
+f = 2*(prec*rec)/(prec+rec)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'Klas. mod. wybrane+koszt'
+
+i=i+1
+```
+
+Tym razem, dokładność dla wyniosła `r acc` (dla zbioru uczącego `r acc.ucz`), a wartość miary F `r f`. Dodanie mechanizmu kosztowego nie poprawiło znacząco dokładności modelu ale poprawiło wartość miary F, dlatego też zdecydowaliśmy się na interpretację modelu pierwszego z przycinaniem oraz z implementacją mechanizmu kosztowego. Okazuje się jednak, że dobrana tu liczba podziałów przekracza 150. Wydrukowanie takiego drzewa z opisem każdego punktu podziału jest możliwe, ale będzie nieczytelne. Poniżej zaprezentujemy więc szkieletową strukturę tego modelu, bez nagłówków identyfikujących podział.
+
+### Interpretacja najlepszego modelu
+
+```{r}
+plot(model.1a.k.p)
+```
+
+Liczba podziałów również generuje ogromną liczbę reguł do zinterpretowania. Wybierzemy więc niektóre z nich, które zintepretujemy a pozostałe interpretowane będą analogicznie.
+
+```{r}
+head(rpart.rules(model.1a.k.p,  'tallw'))
+```
+
+Powyższe zasady mówią, że:
+
+-   jeżeli wartość transakcji inicjującej jest mniejsza od 5.5, rodzaj karty to ELECTRON, liczba dni do wygaśnięcia karty dla transakcji inicjującej jest większa bądź równa 898 oraz liczba dni do wygaśnięcia karty jest pomiędzy 987 a 994 lub
+-   jeżeli wartość transakcji inicującej jest pomiędzy 4.5 a 10.5, rodzaj karty to BLACK, BUSINESS, CLASSIC, CLASSIC/GOLD, CORPORATE, CORPORATE T&E, ENHANCED, GOLD, GOLD/PLATINUM, GOLD/STANDARD, INFINITE, INFINITE/SIGNATURE, NEW WORLD, OTHER, PERSONAL, PLATINUM, REWARDS, SIGNATURE, STANDARD, STANDARD UNEMBOSSED, STANDARD/WORLD, TITANIUM, WORLD, WORLD BLACK, WORLD BLACK EDITION, WORLD ELITE, liczba dni do wygaśnięcia karty dla transakcji inicjującej jest wieksza bądź równa 1765, a liczba dni do wygaśnięcia karty jest większa bądź równa 1754 lub
+-   jeżeli wartość transakcji inicjującej jest pomiędzy 10 a 10.5, rodzaj karty to CLASSIC, GOLD albo BUSINESS oraz liczba dni do wygaśnięcia karty dla transakcji inicjującej jest pomiędzy 1396 a 1402 lub
+-   jeżeli wartość transakcji inicjującej jest pomiędzy 97.3 a 99.3 a rodzaj karty to STANDARD 
+-   jeżeli wartość transakcji inicjującej jest pomiędzy 10.5 a 205, rodzaj karty to BUSINESS albo CORPORATE, liczba dni do wygaśnięcia karty dla transakcji inicjującej jest pomiędzy 547 a 1783 oraz liczba dni do wygaśnięcia karty jest mniejsza od 456 lub
+- jeżeli wartość transakcji inicjującej jest pomiędzy 10.5 a 84.5, rodzaj karty to GOLD, PLATINUM albo CLASSIC, liczba dni do wygaśnięcia karty dla transakcji inicjującej jest pomiędzy 1381 a 1414 oraz liczba dni do wygaśnięcia karty jest większa bądź równa 1348
+
+wówczas wartość zmiennej objaśnianej jest 0, czyli transakcja zostanie zakwalifikowana jako nieudana. Warto tutaj zaznaczyć, że nie zostały tutaj objęte wszystkie warunki dla predykcji `target = 0`. Kwalifikacja wartości predykcji do jednej z dwóch klas odbywa się następująco - jeśli wartość jest mniejsza od 0.5, wówczas predykcja jest przypisana do klasy "0", "1" w przeciwnym przypadku.
+
+Poniżej wylistowanych zostanie kilka zasad mówiących o zakwalifikowaniu wartości zmiennej objaśnanej jako 1, czyli kwalifikacja transakcji jako udana.
+
+```{r}
+tail(rpart.rules(model.1a.k.p,  'tallw'))
+```
+
+Zasady te oznaczają, że (przez gwiazdkę oznaczony zostanie bardzo długi warunek, powtarzający się kilka razy, dla rodzajów kart BUSINESS, ENHANCED, GOLD, GOLD/PLATINUM, GOLD/STANDARD, INFINITE, NEW WORLD, OTHER, PLATINUM, REWARDS, SIGNATURE, STANDARD UNEMBOSSED, TITANIUM, WORLD, WORLD BLACK, WORLD BLACK EDITION, WORLD ELITE):
+
+-   jeżeli wartość transakcji inicjującej jest mniejsza od 4.5, rodzaj karty to \*, liczba dni do wygaśnięcia karty dla transakcji inicjującej jest pomiędzy 565 a 616 oraz liczba dni do wygaśnięcia karty jest pomiędzy 444 a 1020 lub
+-   jeżeli wartość transakcji inicjującej jest mniejsza od 4.5, rodzaj karty to \*, liczba dni do wygaśnięcia karty dla transakcji inicjującej jest pomiędzy 334 a 387 oraz liczba dni do wygaśnięcia karty jest mniejsza od 271 lub
+-   jeżeli wartość transakcji inicjującej jest mniejsza od 4.5, rodzaj karty to \*, liczba dni do wygaśnięcia karty dla transakcji inicjującej jest mniejsza od 683 oraz liczba dni do wygaśnięcia karty pomiędzy 271 a 444 lub
+-   jeżeli wartość transakcji inicjującej jest mniejsza od 4.5, rodzaj karty to BUSINESS, OTHER, PLATINUM lub WORLD, liczba dni do wygaśnięcia karty dla transakcji inicjującej jest pomiędzy 683 a 974 oraz liczba dni do wygaśnięcia karty pomiędzy 858 a 919 lub
+-   jeżeli wartość transakcji inicjującej jest mniejsza od 4.5, rodzaj karty to \*, liczba dni do wygaśnięcia karty dla transakcji inicjującej jest pomiędzy 1206 a 1220 oraz liczba dni do wygaśnięcia karty jest mniejsza od 2697 lub
+-   jeżeli wartość transakcji inicjującej jest mniejsza od 4.5, rodzaj karty to BUSINESS, liczba dni do wygaśnięcia karty dla transakcji inicjującej jest większa bądź równa 1773 oraz liczba dni do wygaśnięcia karty jest mniejsza niż 1779
+
+wówczas wartość zmiennej objaśnanej to 1, czyli transakcja zostanie zakwalifikowana jako udana (znów, nie zostały objęte wszystkie warunki dla predykcji `target = 1`). Ostatnie dwa warunki przeczą postawionym przez nas tezom, jakoby bliski czas do wygaśnięcia karty mógł być oznaką transakcji nieudanej, ale niewykluczone, że pozostałe warunki powodują, że do tego warunku nie wchodzą nieważne karty.
+
+Tym samym zakończylismy tworzenie klasycznych modeli drzew decyzyjnych i przejdziemy do bardziej zaawansowanych metod: bagging, boosting oraz random forest. Zaliczane są one do modeli reprezentujących podejście wielomodelowe Tak jak w sprawdzaniu krzyżowym - tworzonych jest `x` podzbiorów zbioru uczącego i na podstawie każdej z nich tworzone są osobne drzewa klasyfikacyjne, które później 'wybierają' klasę poprzez głosowanie większościowe. W przypadku wystąpienia remisu, przyporządkowanie jest najczęściej losowane (wynika to jednak z implementacji w każdej z bibliotek). Rozwiązaniem może być dobór nieparzystej liczby drzew.
+
+W tych modelach również musimy uważać na przeuczenie. Dobór optymalnej liczby budowanych drzew odbywać się będzie wobec podobnej zasady co w dotychczasowych modelach - wybrana będzie liczba drzew dla której błąd grupowy jest większy od minimalnego błędu o nie więcej niż jedno odchylenie standardowe.
+
+## Bagging
+
+Nazwa bagging pochodzi od bootstrap aggregating - metody znanej z Metody Reprezentacyjnej. Polega ona na tworzeniu ustalonej liczby podprób poprzez losowanie ze zwracaniem, o takiej samej liczebności co zbiór uczący. Następnie dla każdej podpróby tworzone jest drzewo a decyzja co do klasyfikacji odbywa się poprzez głosowanie większościowe.
+
+Estymacje modeli rozpoczniemy od modelu z predyktorami wybranymi przez nas, czyli zmiennymi `expirydiff.init`, `expirydiff`, `amount` oraz `level`. Następnie stworzymy modele bazując na ważności zmiennych. Przycinanie drzew będzie tu wyglądało nieco inaczej niż w przypadku poprzednich modeli - tutaj wybierać będziemy liczbę drzew, które mają zostać stworzone, czyli liczbę podzbiorów zbioru uczącego. Dla modeli przed przycięciem, ustaliliśmy liczbę drzew na 30.
+
+### Model z dobranymi przez nas zmiennymi
+
+```{r}
+model.bagging <- bagging(target~expirydiff.init+expirydiff+amount.init+level, data = do_modelu, mfinal = 30, control = rpart.control(cp = 0))
+
+blad <- errorevol(model.bagging, dane.walidacyjna)
+
+p <- min(blad$error)
+se <- sqrt((p*(1-p))/nrow(dane.walidacyjna))
+optymalne.m <- which(blad$error< (p+se))[1]
+
+predykcja <- predict.bagging(object = model.bagging, newdata = dane.walidacyjna, newmfinal = optymalne.m, control = rpart.control(cp = 0), type = "class")
+
+t = table(Rzeczywiste = dane.walidacyjna$target, Przewidywane = predykcja$class)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja$class == dane.walidacyjna$target) / nrow(dane.walidacyjna)
+
+f = 2*(prec*rec)/(prec+rec)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'Bagg. mod. wybrane'
+
+i=i+1
+```
+
+Model ten charakteryzuje się dokładnością na zbiorze walidacyjnym na poziomie `r acc` oraz wartością miary F `r f`. Wartość dokładności jest bardzo wysoka, miara F jednak nie jest na znacznie wyższym poziomie niż w przypadku modeli klasycznych. Precyzja kształtuje się na poziomie około 0.75, a czułość na poziomie około 0.55.
+
+Po stworzeniu pierwszego modelu, dobierzemy teraz zmienne względem ich ważności w modelu pełnym. Jego estymacja znajduje się poniżej.
+
+### Model z ważnościami zmiennych
+
+```{r}
+model.bagging.imp <- bagging(target~.,do_modelu,mfinal=30, control = rpart.control(cp = 0))
+
+blad <- errorevol(model.bagging.imp, dane.walidacyjna)
+p <- min(blad$error)
+se <- sqrt((p*(1-p))/nrow(dane.walidacyjna))
+optymalne.m <- which(blad$error< (p+se))[1]
+
+model.bagging.imp.p <- bagging(target~., do_modelu, mfinal=optymalne.m, control = rpart.control(cp = 0))
+
+knitr::kable(cbind(sort(model.bagging.imp.p$importance, decreasing = T)), caption = 'Ważność zmiennych')
+```
+
+Powyżej umieszczone są wyliczone wartości relatywnej ważności zmiennych. W tym przypadku, bierze ona pod uwagę wzrost wartości indeksu Giniego w każdym z budowanych drzew. Wartości te są znacznie niższe niż w przypadku klasycznego drzewa klasyfikacyjnego. W związku z tym stworzymy dwa modele - pierwszy z nich będzie zawierał trzy pierwsze zmienne - `resolution.init`, `expirydiff`, `expirydiff.init` (mające ważność większą od 10), a drugi z nich będzie zawierał zmienne o współczynniku `importance` większym od 5.
+
+### Model 1 z dobranymi zmiennymi poprzez współczynnik ważności
+
+```{r}
+rm(model.bagging.imp)
+
+model.bagging.1 <- bagging(target~resolution.init+expirydiff.init+expirydiff,do_modelu,mfinal=20, control = rpart.control(cp = 0))
+
+blad <- errorevol(model.bagging.1, dane.walidacyjna)
+p <- min(blad$error)
+se <- sqrt((p*(1-p))/nrow(dane.walidacyjna))
+optymalne.m <- which(blad$error< (p+se))[1]
+
+predykcja <- predict.bagging(object = model.bagging.1, newdata = dane.walidacyjna, newmfinal = optymalne.m, control = rpart.control(cp = 0), type = "class")
+
+t = table(Rzeczywiste = dane.walidacyjna$target, Przewidywane = predykcja$class)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja$class == dane.walidacyjna$target) / nrow(dane.walidacyjna)
+
+f = 2*(prec*rec)/(prec+rec)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'Bagg. mod. 1'
+
+i=i+1
+```
+
+W tym modelu dokładność wyniosła `r acc`, a miara F `r f`. Dokładność jest lekko niższa niż dla modelu początkowego, miara F jest za to znacząco mniejsza. Wynika to z faktu, że model ten zakwalifikował większość obserwacji jako udane, tworząc wysoką dysproporcję w fałszywych predykcjach co wpływa na wartość miary F. Zgodnie z założeniami wymienionymi wcześniej, do modelu dołożymy zmienne `expirymonth`, `createwdate.init`, `browseragent.init` oraz `level`.
+
+### Model 2 z dobranymi zmiennymi poprzez współczynnik ważności
+
+```{r}
+rm(model.bagging.1)
+
+model.bagging.2 <- bagging(target~resolution.init+expirydiff+expirydiff.init+browseragent.init+level+expirymonth+createwdate.init,do_modelu,mfinal=20, control = rpart.control(cp = 0))
+
+blad <- errorevol(model.bagging.2, dane.walidacyjna)
+p <- min(blad$error)
+se <- sqrt((p*(1-p))/nrow(dane.walidacyjna))
+optymalne.m <- which(blad$error< (p+se))[1]
+
+predykcja <- predict.bagging(object = model.bagging.2, newdata = dane.walidacyjna, newmfinal = optymalne.m, control = rpart.control(cp = 0), type = "class")
+
+t = table(Rzeczywiste = dane.walidacyjna$target, Przewidywane = predykcja$class)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja$class == dane.walidacyjna$target) / nrow(dane.walidacyjna)
+
+f = 2*(prec*rec)/(prec+rec)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'Bagg. mod. 2.'
+
+i=i+1
+```
+
+W tym przypadku, dokładność wyniosła `r acc`, a wartość miary F `r f`. Poziom dokładności jest prawie taki sam jak dla modelu z 'wybranymi' zmiennymi jednak wartość miary F jest już nieznacznie wyższa w przypadku tego modelu. Do intepretacji wybierzemy więc model wyestymowany powyżej. W przypadku modeli bagging oraz boosting nie ma jednego drzewa, względem którego można rozpisać szereg zasad klasyfikujących obserwacje. Tutaj mamy pewną ilość drzew, które głosując 'wybierają' klasę do której zostanie przydzielona dana obserwacja. Można oczywiście interpretować każde ze stworzonych przez ten model drzew osobno, gdyż w istocie jest to `x` drzew klasyfikacyjnych bazujących na podzbiorach głownego zbioru, lecz jest to czasochłonne i nie otrzymuje się w ten sposób jednoznacznego zbioru zasad wobec których odbywa się klasyfikacja. Dlatego też, w ramach intepretacji tego modelu zaprezentuję wykres kształtowania się błędów na zbiorach uczącym i walidacyjnym oraz wykres prezentujący rozkład głosów.
+
+### Interpretacja najlepszego modelu
+
+```{r}
+rm(model.bagging)
+
+blad.ucz <- errorevol(model.bagging.2, do_modelu)
+blad.wal <- errorevol(model.bagging.2, dane.walidacyjna)
+
+plot.errorevol(x = blad.ucz, y = blad.wal)
+
+p <- min(blad.wal$error)
+se <- sqrt((p*(1-p))/nrow(dane.walidacyjna))
+optymalne.m <- which(blad.wal$error< (p+se))[1]
+
+predykcja <- predict.bagging(object = model.bagging.2, newdata = dane.walidacyjna, newmfinal = optymalne.m, control = rpart.control(cp = 0), type = "class")
+t <- table(Rzeczywiste = dane.walidacyjna$target, Głosy = predykcja$votes[,2])
+barplot(t, legend.text = T, args.legend = list(x="top", title = "Rzeczywista klasa"), xlab = "Liczba głosów na zakwalifikowanie transakcji jako udanej")
+```
+
+Na powyższych wykresach zaobserwować można kształtowanie się błędów oraz rozkład głosów kwalifikujących transakcję jako udaną.
+
+Błędy bardzo szybko stabilizowały się. Kryterium jednego błędu standardowego wybrało 9 drzew jako optymalną liczbę do estymacji, która wiąże niski błąd, brak przeuczenia oraz wysoką efektywność modelu. Model ten stworzył więc 9 podzbiorów uczących i na podstawie 'głosowania' każdego z nich klasyfikował zmienną `target`. Na wykresie prezentującym liczbę głosów Widać, że znacząca większość udanych transakcji została jednogłośnie wybrana przez wszystkie drzewa, a im mniejsza liczba głosów tym znacznie mniejsza liczba głosów na 'tak'. Wartości będące w rzeczywistości transakcjami nieudanymi miały równomierny rozkład głosów na 'tak' (z lekkim wskazaniem na 0 głosów). Przejdziemy teraz do modeli typu 'boosting'.
+
+## Boosting
+
+Kolejne drzewa budowane tą metodą zależą w pewnym sensie od poprzednich - brane są pod uwagę błędy predykcji z drzew zbudowanych w poprzednich krokach. Jest to więc przykład modelu sekwencyjnego lub iteracyjnego. Wybieranych jest $M$ modeli bazowych, każdy poprzez losowanie ze zwracaniem. W pierwszym kroku tworzenia $x$-tego modelu bazowego wyliczane są wagi, jako $\frac{1}{N}$, gdzie N to wielkość zbioru uczącego. Następnie tworzone jest drzewo dla którego określany jest błąd predykcji jako suma wag błędnie zakwalifikowanych obserwacji. Jeśli ten błąd jest 0 lub przekracza 0.5 następuje koniec algorytmu dla $x$-tego drzewa i budowane jest następne. W przeciwnym wypadku wagi są modyfikowane jako pewna operacja na błędach (w zależności od dobranego algorytmu wyliczania wag). Ten typ budowania drzew charakteryzuje się przekształcaniem słabych drzew decyzyjnych w mocne poprzez używanie błędów predykcji w kolejnych krokach tworzenia modeli.
+
+Tak jak w przypadku poprzednich modeli, rozpoczniemy od stworzenia modelu z wybranymi przez nas zmiennymi `expirydiff.init`, `expirydiff`, `amount.init`, `level`, następnie stworzymy model pełny na podstawie którego wybierzemy zmienne na podstawie ważności. Ważność jest tutaj wyliczana tak samo jak dla modeli typu 'bagging'.
+
+### Model z dobranymi indywidualnie
+
+```{r}
+model.adaboost <- boosting(target ~ expirydiff.init+expirydiff+amount.init+level,do_modelu,mfinal=30, control = rpart.control(cp = 0))
+
+bledy.walidacyjny <- errorevol(model.adaboost, dane.walidacyjna)
+p <- min(bledy.walidacyjny$error)
+se <- sqrt((p*(1-p))/nrow(dane.walidacyjna))
+optymalne.m <- which(bledy.walidacyjny$error< (p+se))[1]
+
+predykcja <- predict.boosting(model.adaboost,newdata=dane.walidacyjna,newmfinal = optymalne.m, control = rpart.control(cp = 0))
+
+t = table(Rzeczywiste = dane.walidacyjna$target, Przewidywane = predykcja$class)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja$class == dane.walidacyjna$target) / nrow(dane.walidacyjna)
+
+f = 2*(prec*rec)/(prec+rec)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'Boost. mod. wybrane'
+
+i=i+1
+```
+
+W tym modelu dokładność na zbiorze walidacyjnym ukształtowała się na poziomie `r acc`, a wartość miary F na poziomie `r f`. Obie te miary są na zadowalająco wysokim poziomie. Parametry składowe miary F czyli precyzja oraz czułość miały bardzo podobną wartość - około 0.75. Jest to model, którego z pewnością użyjemy do predykcji na danych testowych, gdyż zwraca on satysfakcjonujące wyniki już dla danych walidacyjnych. Zobaczymy jednak jak prezentuje się wartość ważności poszczególnych zmiennych - może okazać się, że wyestymujemy jeszcze lepszy model bazując na tej informacji.
+
+### Model z ważnościami
+
+```{r}
+model.adaboost.imp <- boosting(target~.,do_modelu,mfinal=30, control = rpart.control(cp = 0))
+
+blad <- errorevol(model.adaboost.imp, dane.walidacyjna)
+p <- min(blad$error)
+se <- sqrt((p*(1-p))/nrow(dane.walidacyjna))
+optymalne.m <- which(blad$error< (p+se))[1]
+
+model.adaboost.imp.p <- boosting(target~., do_modelu, mfinal=optymalne.m, control = rpart.control(cp = 0))
+
+knitr::kable(cbind(sort(model.adaboost.imp.p$importance, decreasing = T)), caption = 'Ważność zmiennych')
+```
+
+Tutaj również wartości ważności zmiennych są niskie i podobnie jak w przypadku modeli 'bagging', stworzymy dwa modele. Pierwszy z nich zawierać będzie zmienne `expirydiff`, `resolution.init` oraz `expirydiff.init`, mające ważność większą od 10, a do drugiego z nich dołożymy zmienne z pierwszego modelu oraz zmienną `createwdate`.
+
+### Model 1 z dobranymi zmiennymi poprzez współczynnik ważności
+
+```{r}
+rm(model.adaboost.imp)
+
+model.adaboost.1 <- boosting(target~expirydiff+resolution.init+expirydiff.init,do_modelu,mfinal=30, control = rpart.control(cp = 0))
+
+blad <- errorevol(model.adaboost.1, dane.walidacyjna)
+p <- min(blad$error)
+se <- sqrt((p*(1-p))/nrow(dane.walidacyjna))
+optymalne.m <- which(blad$error< (p+se))[1]
+
+
+
+predykcja <- predict.boosting(model.adaboost.1,newdata=dane.walidacyjna,newmfinal = optymalne.m, control = rpart.control(cp = 0))
+
+t = table(Rzeczywiste = dane.walidacyjna$target, Przewidywane = predykcja$class)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja$class == dane.walidacyjna$target) / nrow(dane.walidacyjna)
+
+f = 2*(prec*rec)/(prec+rec)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'Boost. mod. 1.'
+
+i=i+1
+```
+
+Dokładność wyniosła `r acc`, a miara F `r f`. Obie te wartości są niższe niż w przypadku modelu pierwszego, więc nie będziemy go brali pod uwagę.
+
+### Model 2 z dobranymi zmiennymi poprzez współczynnik ważności
+
+```{r}
+rm(model.adaboost.1)
+
+model.adaboost.2 <- boosting(target~expirydiff+resolution.init+expirydiff.init+createwdate,do_modelu,mfinal=30, control = rpart.control(cp = 0))
+
+blad <- errorevol(model.adaboost.2, dane.walidacyjna)
+p <- min(blad$error)
+se <- sqrt((p*(1-p))/nrow(dane.walidacyjna))
+optymalne.m <- which(blad$error< (p+se))[1]
+
+predykcja <- predict.boosting(model.adaboost.2,newdata=dane.walidacyjna,newmfinal = optymalne.m, control = rpart.control(cp = 0))
+
+t = table(Rzeczywiste = dane.walidacyjna$target, Przewidywane = predykcja$class)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja$class == dane.walidacyjna$target) / nrow(dane.walidacyjna)
+
+f = 2*(prec*rec)/(prec+rec)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'Boost. mod. 2.'
+
+i=i+1
+```
+
+Ten model okazał się trochę gorszy od modelu ze zmiennymi dobranymi personalnie. Dokładność wyniosła `r acc`, a miara F `r f`. Można również zauważyć w czym ten model jest lepszy od poprzedniego - porównując tabele kontyngencji zauwazyć można, że model przewiduje znacznie więcej transakcji nieudanych. Z tego wynika wyższa wartość miary F oraz delikatnie wyższa dokładność. Uznaliśmy model 'wybrany' za lepszy ze względu na troszkę wyższe wartości parametrów oceny modelu. Dlatego też przedstawimy poniżej jego interpretację. Ze względu na fakt, że model ten jest podobny konceptualnie do modeli typu 'bagging', interpretacja będzie wyglądała bardzo podobnie - na podstawie wykresów błędów oraz rozkładu głosów kwalifikujących transakcję jako udaną.
+
+### Interpretacja najlepszego modelu
+
+```{r}
+rm(model.adaboost.2)
+
+blad.ucz <- errorevol(model.adaboost, do_modelu)
+blad.wal <- errorevol(model.adaboost, dane.walidacyjna)
+
+plot.errorevol(x = blad.ucz, y = blad.wal)
+
+p <- min(blad.wal$error)
+se <- sqrt((p*(1-p))/nrow(dane.walidacyjna))
+optymalne.m <- which(blad.wal$error< (p+se))[1]
+
+predykcja <- predict.bagging(object = model.adaboost, newdata = dane.walidacyjna, newmfinal = optymalne.m, control = rpart.control(cp = 0), type = "class")
+t <- table(Rzeczywiste = dane.walidacyjna$target, Głosy = predykcja$votes[,2])
+barplot(t, legend.text = T, args.legend = list(x="top", title = "Rzeczywista klasa"), xlab = "Liczba głosów na zakwalifikowanie transakcji jako udanej")
+```
+
+W przypadku tego modelu błędy ustabilizowały się dopiero po około 10 wyestymowanych drzewach. Procedura (taka sama jak w przypadku modeli 'bagging') dobrała optymalną liczbę drzew na 18. Na wykresie widać, że duża część transakcji udanych była wybierana jednogłośne, jednakże było też dużo doborów niejednogłośnych - z liczbą głosów pomiędzy 10 a 17. Rozkład dla tych wartości przypominał nieco rozkład normalny. Poniżej wartości odcinającej w głosowaniu większościowym (czyli 8 głosów) znajdowało się stosunkowo mało obserwacji będących transakcjami udanymi (co zresztą ma swoje odzwierciedlenie we wcześniej prezentowanej tabeli kontyngencji). Rozkład rzeczywistych transakcji nieudanych między 3 a 8 głosami jest dosyć równomierny, poza mocnym peakiem dla 6 głosów.
+
+Wyestymowany przez nas model okazał się bardzo udany i jesteśmy z niego zadowoleni. Chcielibyśmy jednak przyjrzeć się jeszcze jednej metodzie klasyfikacji drzewami, jaką jest las losowy.
+
+## Las losowy
+
+Metoda ta działa podobnie do procedury 'bagging' w tym sensie, że podpróby zbioru uczącego są dobierane tak samo. Różnica jednak jest taka, że w każdym węźle pojedynczego drzewa wybieranych jest `i` zmiennych (niezależnie dla każdego podziału) branych pod uwagę do tworzenia danego warunku. Optymalna liczba tych zmiennych to według autora metody pierwiastek z liczby wszystkich zmiennych wchodzących do modelu. Tak jak w poprzednich metodach, klasyfikacja odbywa się na podstawie głosowania większościowego.
+
+Zanim jednak rozpoczniemy budowanie modeli, należy przekształcić nieco nasze dane. Wynika to z faktu, że zaimplementowana w bibliotece `randomForest` funkcja tworząca lasy losowe nie obsługuje braków danych. Ma ona mechanizm imputacji danych, jednakże nie jest on najlepszy i daje nam on kontroli nad faktycznymi danymi. Dlatego też usuniemy ze zbioru danych 'problematyczne' kolumny, posiadające dużo braków - `screenwidth.init`, `screenheight.init`, `screenwidth`, `screenheight`, `browseragent`, `resolution` oraz `resolution.init`. Musimy również pominąć zmienną `amount` ze względu na występowanie dużej liczby braków danych w zbiorze testowym. W przypadku zmiennych wybranych przez nas, zastąpimy `amount` przez `amount.init`. Następnie usuniemy obserwacje z brakami danych, najczęściej będą to transakcje inicjujące, które nie mają wartości w kolumnach z sufiksem `.init`. Na tych danych budowany i walidowany będzie model.
+
+Optymalizacja modeli odbywać się będzie poprzez dobór ilości drzew, dla której błąd predykcji jest najmniejszy.
+
+### Model z ważnościami
+
+```{r include = T}
+
+do_modelu.nona = do_modelu %>% dplyr::select(-c(screenwidth.init, screenheight.init, resolution.init)) %>% drop_na()
+dane.walidacyjna.nona = dane.walidacyjna %>% dplyr::select(-c(screenwidth.init, screenheight.init, resolution.init)) %>% drop_na()
+
+model.rf.init <- rfsrc(target ~ ., 
+                 data = do_modelu.nona,
+                 block.size = 1,
+                 ntree = 100)
+
+predykcje.rf <- predict(model.rf.init, newdata = dane.walidacyjna.nona,
+                        block.size = 1)
+
+model.rf.init.opt <- rfsrc(target ~ ., 
+                 data = do_modelu.nona,
+                 block.size = 1,
+                 importance = T,
+                 ntree = which.min(predykcje.rf$err.rate[, "all"]))
+
+waznosc <- model.rf.init.opt$importance
+waznosc <- waznosc[waznosc[,"all"]>0.1,]
+waznosc <- waznosc[order(waznosc[, "all"], decreasing = T),]
+
+knitr::kable(waznosc, caption = 'Ważność zmiennych')
+```
+
+Wybrane zostały zmienne, dla których ważność dla obu klas jest wyższa od 0.1. Są to zmienne `expirydiff.init`, `expirydiff`, `level.init`, `level`, `countrycode.init`, `countrycode`, `browseragent.init` oraz `amount.init`. Rozpoczniemy dobór modeli od tego z wybranymi przez nas zmiennymi, identycznymi jak w przypadku poprzednich typów modeli klasyfikacyjnych. 
+
+### Model z wybranymi zmiennymi
+
+```{r}
+model.rf.wyb <- rfsrc(target ~ expirydiff.init+expirydiff+amount.init+level, do_modelu.nona, block.size = 1, ntree = 100)
+
+predykcja.rf <- predict(model.rf.wyb, newdata = dane.walidacyjna.nona, block.size = 1)
+
+model.rf.wyb.opt <- rfsrc(target ~ expirydiff.init+expirydiff+amount.init+level, do_modelu.nona, block.size = 1, importance = T, ntree = which.min(predykcja.rf$err.rate[, "all"]))
+
+predykcja.rf <- predict(model.rf.wyb.opt, newdata = dane.walidacyjna.nona, block.size = 1)
+
+t = table(Rzeczywiste = dane.walidacyjna.nona$target, Przewidywane = predykcja.rf$class)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja.rf$class == dane.walidacyjna.nona$target) / nrow(dane.walidacyjna.nona)
+
+f = 2*(prec*rec)/(prec+rec)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'Ran. For. mod. wybrane'
+
+i=i+1
+```
+
+Model ten charakteryzuje się dokładnością `r acc` oraz wartością miary F `r f` (precyzja oraz czułość są zbliżone do wartości miary F). Kształtują się one na nieco wyższym poziomie niż te wynikające z któregokolwiek wcześniejszego modelu. Teraz wyestymujemy model ze zmiennymi wynikającymi z wartości współczynnika ważności.
+
+### Model z dobranymi zmiennymi poprzez współczynnik ważności
+
+```{r}
+model.rf.1 <- rfsrc(target ~ expirydiff.init+expirydiff+level.init+level+countrycode.init+countrycode+countrycode+browseragent.init, do_modelu.nona, block.size = 1, ntree = 100)
+
+predykcja.rf <- predict(model.rf.1, newdata = dane.walidacyjna.nona, block.size = 1)
+
+model.rf.1.opt <- rfsrc(target ~ expirydiff.init+expirydiff+level.init+level+countrycode.init+countrycode+countrycode+browseragent.init, do_modelu.nona, block.size = 1, importance = T, ntree = which.min(predykcja.rf$err.rate[, "all"]))
+
+predykcja.rf <- predict(model.rf.1.opt, newdata = dane.walidacyjna.nona, block.size = 1)
+
+t = table(Rzeczywiste = dane.walidacyjna.nona$target, Przewidywane = predykcja.rf$class)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja.rf$class == dane.walidacyjna.nona$target) / nrow(dane.walidacyjna.nona)
+
+f = 2*(prec*rec)/(prec+rec)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'Ran. For. mod. 1'
+
+i=i+1
+```
+
+W tym modelu wartość dokładności to `r acc`, a wartość miary F to `r f` (przy precyzji nieco niższej od czułości, o 0.03). Obie te miary są na bardzo podobnym poziomie jak te w poprzednim modelu, jednakże minimalnie niższe. Dlatego też zdecydujemy się na wybór tamtego modelu do dalszych rozważań. 
+
+Tak jak w przypadku modeli typu bagging czy boosting, tutaj też jest zostało stworzonych kilkanaście drzew klasyfikacyjnych i czasochłonnym byłoby interpretowanie każdego z nich osobno. Dlatego też przedstawimy błędy w najlepszym modelu.
+
+### Prezentacja błędów w najlepszym modelu
+
+```{r}
+rm(model.rf.1.opt)
+rm(model.rf.1)
+rm(model.rf.wyb)
+
+predykcja.rf <- predict(model.rf.wyb.opt, newdata = dane.walidacyjna.nona, block.size = 1)
+
+predykcja.rf.ucz <- predict(model.rf.wyb.opt, newdata = do_modelu.nona, block.size = 1)
+
+matplot(predykcja.rf$err.rate, type = "l", lty = 1,
+        ylim = c(0, 0.8), xlab = "Liczba drzew", ylab = "Błąd")
+matplot(model.rf.wyb.opt$err.rate, type = "l", lty = 2, add = T)
+matplot(predykcja.rf.ucz$err.rate, type = "l", lty = 3, add = T)
+
+legend(x = "topright", legend = c("Wszystkie", "0", "1"),
+       lty = 1, col = 1:3, cex = 0.6)
+legend(x = "top", legend = c("Walidacyjny", "Model", "Uczacy"),
+       lty = 1:3, col = 1, cex = 0.6)
+```
+
+Przedstawione zostały błędy dla poszczególnej liczby drzew, zbioru walidacyjnego, uczącego oraz błędy wynikające wprost z modelu dla trzech wariantów - klasy 0, klasy 1 oraz obu klas razem. Widać, ze błąd dosyć szybko stabilizował się na równym poziomie i nie można tutaj mówić o przeuczeniu modelu. Dla klasy 0 ten błąd był jednak dosyć wysoki, co może wynikać z braku zbalansowania zbioru - jest znacznie więcej obserwacji z udanymi transakcjami więc model 'skupia' się na poprawnym zaklasyfikowaniu tych obserwacji.
+
+Przejdziemy teraz do ostatniego typu modeli, który zostanie stworzony w ramach tego zadania, czyli modeli typu MARS.
+
+## Model MARS
+
+Modele MARS, czyli Multivariate Adaptive Regression Splines proponują przybliżanie nieliniowych danych poprzez wybór punktów odcięcia, w których to zmieniać się będą pary tzw. funkcji bazowych, będących najczęściej funkcjami liniowymi. Bardzo dobrze 'wyłapują' one nieliniowe zależności w danych. Jest to algorytm przeznaczony głównie do problemów regresji, ale spróbujemy go zastosować do problemu klasyfikacji. 
+
+Budowanie modelu składa się z dwóch faz. Pierwsza z nich to wybór oraz dołączanie funkcji bazowych do modelu. Wychodzimy od modelu ze stałą, do którego iteracyjnie dodawane są pary funkcji bazowych. Na każdym kroku dodawana jest para najbardziej minimalizująca sumę kwadratów reszt modelu. Kroki są powtarzane tak długo, aż osiągnięto warunki zatrzymania (maksymalna liczba funkcji bazowych czy brak istotnej poprawy modelu), definiowane przez badacza. Warto zaznaczyć, że funkcje bazowe mogą być dodawane addytywnie ale mogą również wchodzić jako interakcja kilku funkcji z modelu. Druga faza ma na celu usunięcie przeuczenia modelu poprzez iteracyjne usuwanie nieistotnych składników modelu (funkcji bazowych lub interakcji). Ostatecznie wybierany jest model z najmniejszą wartością GCV czyli wartością generalizowanej walidacji krzyżowej.
+
+Ze względu na swoistą samooptymalizację tego modelu, nie będziemy dobierać do niego zmiennych tylko zostanie stworzony model biorący pod uwagę wszystkie zmienne. Wybierzemy model o najmniejszej wartości GCV spośród modeli bez interakcji, z interakcją drugiego stopnia oraz trzeciego stopnia. 
+
+### Model bez interakcji
+
+```{r}
+
+mod.mars.1 <- earth(target ~ ., do_modelu.nona)
+
+predykcja <- predict(mod.mars.1, dane.walidacyjna.nona, 'class')
+
+t = table(Rzeczywiste = dane.walidacyjna.nona$target, Przewidywane = predykcja)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja == dane.walidacyjna.nona$target) / nrow(dane.walidacyjna.nona)
+gcv = mod.mars.1$gcv
+
+f = 2*(prec*rec)/(prec+rec)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'MARS bez int.'
+
+i=i+1
+
+```
+
+Dokładność w tym modelu wyniosła `r acc`, wartość miary F `r f` oraz wartość GCV `r gcv`. Mimo, że dokładność kształtuje się na w miarę zadowalającym poziomie, tak wynik miary F jest bardzo zły. Patrząc na tabelę kontyngencji, widać że model 'wrzucił' prawie wszystkie obserwacje do klasy 1, prawie kompletnie pomijając transakcje nieudane. Stąd też bardzo niska wartość tej miary, wynikająca wprost z bardzo niskiej wartości precyzji (ok. 0.19), podczas gdy czułość utrzymuje się na w miarę zadowalającym poziomie (ok. 0.71). Wartość GCV będziemy używać do porównania tego modelu z pozostałymi dwoma. Spróbujemy dodać interakcję do modelu, aby sprawdzić czy poprawi ona wartość miary F.
+
+### Model z interakcjami 2 stopnia
+
+```{r}
+mod.mars.2 <- earth(target ~ ., do_modelu.nona, degree = 2)
+
+predykcja <- predict(mod.mars.2, dane.walidacyjna.nona, 'class')
+
+t = table(Rzeczywiste = dane.walidacyjna.nona$target, Przewidywane = predykcja)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja == dane.walidacyjna.nona$target) / nrow(dane.walidacyjna.nona)
+
+f = 2*(prec*rec)/(prec+rec)
+
+gcv <- mod.mars.2$gcv
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'MARS z int. 2 st.'
+
+i=i+1
+```
+
+Dokładność wyniosła `r acc`, GCV `r gcv` a miara F `r f`. Miara F jest na nieco wyższym poziomie niż ostatnio (za sprawą trochę wyższej precyzji) lecz nadal nie jest ona na satysfakcjonującym nas poziomie. W tabeli kontyngencji widać, że trochę więcej obserwacji zostało zakwalifikowanych jako nieudane, jednak nadal jest ich zdecydowanie zbyt mało i nie jest odzwierciedlona faktyczna struktura danych. Wartość GCV była niższa dla tego modelu niż dla modelu bez interakcji, więc jest on lepszy od poprzedniego. Przejdziemy teraz do modelu z interakcjami 3 stopnia.
+
+### Model z interakcjami 3 stopnia
+
+```{r}
+mod.mars.3 <- earth(target ~ ., do_modelu.nona, degree = 3)
+
+predykcja <- predict(mod.mars.3, dane.walidacyjna.nona, 'class')
+
+t = table(Rzeczywiste = dane.walidacyjna.nona$target, Przewidywane = predykcja)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja == dane.walidacyjna.nona$target) / nrow(dane.walidacyjna.nona)
+gcv = mod.mars.3$gcv
+
+f = 2*(prec*rec)/(prec+rec)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'MARS z int. 3 st.'
+
+i=i+1
+```
+
+Wartość dokładności to `r acc`, miary F to `r f`, a GCV wyniosło `r gcv`. Znów zauwazyć można lekką poprawę w mierze F, jednak struktura oryginalnego zbioru nadal nie została zachowana, dlatego też ten model nie nadaje się do predykcji zadanego problemu. Wartość miary GCV była najniższa spośród tych trzech modeli. 
+
+Ostatnim krokiem będzie optymalizacja modelu poprzez dobór parametrów `nk` (maksymalna liczba funkcji bazowych w pierwszej fazie tworzenia modelu), `minspan` (minimalna liczba obserwacji między węzłami, czyli punktami odcięcia), oraz `thresh` (minimalna poprawa $R^2$). Mamy nadzieję, że poprawi to predykcje modelu. Patrząc na wartości GCV powinniśmy wybrać model z dwiema lub trzema interakcjami. Model jest wyliczany jednak bardzo długo co przy tworzeniu dużej liczby modeli w celu sprawdzenia kiedy ten błąd będzie minimalny, sprawi że wyliczenia będą bardzo obciążały nasze maszyny. Dlatego też zdecydowaliśmy się na optymalizację najgorszego modelu, czyli tego bez interakcji, gdyż dla niego czas wykonywania operacji był relatywnie najniższy. 
+
+### Optymalizacja modelu bez interakcji
+
+```{r}
+gcv.nk <- sapply(seq(10, 90, 10), function(x) earth(target ~ ., do_modelu.nona, nk = x)$gcv)
+
+gcv.thresh <- sapply(0.1^(3:5), function(x) earth(target ~ ., do_modelu.nona, nk = 60, thresh = x)$gcv)
+
+gcv.minspan <- sapply(10:25, function(x) earth(target ~ ., do_modelu.nona, nk = 60, thresh = 0.0001, minspan = x)$gcv)
+
+mod.mars.opt <- earth(target ~ ., do_modelu.nona, nk = 60, thresh = 0.0001, minspan = 25)
+
+predykcja <- predict(mod.mars.opt, dane.walidacyjna.nona, 'class')
+
+t = table(Rzeczywiste = dane.walidacyjna.nona$target, Przewidywane = predykcja)
+
+knitr::kable(t, caption = 'Tabela kontyngencji dla zbioru walidacyjnego')  %>%  add_header_above(c("Rzeczywiste/Przewidywane" = 3))
+
+rec = t[1,1]/(t[1,1]+t[2,1])
+prec = t[1,1]/(t[1,1]+t[1,2])
+acc = sum(predykcja == dane.walidacyjna.nona$target) / nrow(dane.walidacyjna.nona)
+gcv = mod.mars.opt$gcv
+
+f = 2*(prec*rec)/(prec+rec)
+
+measures.df[1,i] <- acc
+measures.df[2,i] <- prec
+measures.df[3,i] <- rec
+measures.df[4,i] <- f
+colnames(measures.df)[i] <- 'MARS bez int. opt.'
+```
+
+Wartość GCV (`r gcv`) jest co prawda nieznacznie niższa niż dla niezoptymalizowanej wersji tego modelu, ale jest wyższa od GCV dla modeli z interakcjami. Struktura predykcji w tabeli kontyngencji oraz wartości dokładności (`r acc`) oraz miary F (`r f`) są również bardzo niskie. Nie będziemy brać modeli MARS pod uwagę przy wybieraniu modeli do predykcji danych testowych. Dlatego też nie będziemy interpretować współczynników tego modelu. Dodatkowo, jest ich całkiem dużo i zinterpretowanie wszystkich byłoby dosyć czasochłonne (choć nie aż tak jak w przypadku drzew wielomodelowych). Przejdziemy do ostatecznego podsumowania zadania pierwszego.
+
+## Podsumowanie
+
+W tabeli poniżej przedstawione zostało zestawienie miar dobroci dopasowania dla wszystkich zbudowanych przez nas modeli. Na jej podstawie wybierzemy model, który zostanie potem użyty do predykcji na danych testowych.
+
+```{r}
+knitr::kable(round(measures.df,3), caption = 'Zestawienie poszczególnych miar dla zbudowanych modeli')
+```
+
+Wybór okazał się dosyć trudny. Spośród wszystkich modeli najbardziej wyróżniają się modele boosting dla wybranych przez nas zmiennych oraz las losowy ze zmiennymi przez nas wybranymi. Oba z nich charakteryzują się bardzo podobnymi wartościami dokładności i miary F, jednak te wartości dla modelu boosting były odrobinę wyższe i dlatego wybralismy własnie model oparty na boostingu do predykcji na danych testowych - uznaliśmy, że oba wybory będą równie właściwe. Zanim przejdziemy do predykcji, musimy podmienić 4 obserwacje - są to transakcje zawierające poziom karty `PREPAID BUSINESS`, który nie występował w zbiorze uczącym i walidacyjnym -  zamienimy tę wartość na `PREPAID`. Poniżej znajduje się kod przyporządkowujący klasę do obserwacji ze zbioru testowego i zapisujący je do odpowiedniego data.frame. 
+
+```{r}
+levels(proba_testowa_merged$level)[levels(proba_testowa_merged$level)=="PREPAID BUSINESS"] <- "PREPAID"
+
+bledy.walidacyjny <- errorevol(model.adaboost, dane.walidacyjna)
+p <- min(bledy.walidacyjny$error)
+se <- sqrt((p*(1-p))/nrow(dane.walidacyjna))
+optymalne.m <- which(bledy.walidacyjny$error< (p+se))[1]
+
+model.koncowy <- adabag::boosting(target ~ expirydiff.init+amount.init+expirydiff+level, do_modelu, mfinal=optymalne.m, control = rpart.control(cp = 0))
+
+predykcje.test <- predict(model.koncowy,newdata=proba_testowa_merged)
+
+to.merge <- data.frame(cbind(id = as.numeric(proba_testowa_merged$id),pred = ifelse(predykcje.test$class=="1","sukces","porażka")))
+
+predykcje_testowa.m <- merge(predykcje_testowa, to.merge, by.x = 'id', by.y = 'id', all.x = T)
+predykcje_testowa.m <- predykcje_testowa.m %>% dplyr::select(-status) %>% mutate(status = pred) %>% dplyr::select(-pred)
+
+predykcje_testowa <- predykcje_testowa.m
+```
+
+Tym samym zakończyliśmy zadanie pierwsze i rozpoczniemy zadanie drugie dotyczące problemu regresji.
+
+# Zadanie 2
+
+## Drzewa regresyjne
+
+
+Drugim wyzwaniem jakie stoi przed nami, jest zbudowanie modelu predykcyjnego dotyczącego zmiennej 'amount' dla transakcji rekurencyjnych. Zmienna 'amount' jest niczym innym jak wartością transakcji jaka została dokonana. Jest to, w odróżnieniu do punktu pierwszego, zmienna ilościowa. W tym wypadku zadaniem modelu nie jest klasyfikacja, a regresja.
+
+Istotą zadania jest działanie na transakcjach rekurencyjnych, w związku z tym pierwszym krokiem jaki należy wykonać, jest odfiltrowanie transakcji rekurencyjnych od incjalizujących. Przygotowane zostaną zbiory do uczenia, walidacji oraz testowania.
+
+```{r}
+recur_learn = proba_uczaca_merged %>% filter(isrecurring=='TRUE')
+recur_test = proba_testowa_merged %>% filter(isrecurring=='TRUE')
+levels(proba_testowa_merged$level)[levels(proba_testowa_merged$level)=="PREPAID BUSINESS"] <- "PREPAID"
+
+groups <- sample(rep(c("learn","valid"), round(c(0.7,0.3)*nrow(recur_learn))))
+
+reg_learn_data <- recur_learn[groups=='learn',]
+reg_valid_data <- recur_learn[groups=='valid',]
+
+usefull_data_learn <- reg_learn_data %>% dplyr::select(-c(isrecurring))
+usefull_data_valid <- reg_valid_data %>% dplyr::select(-c(isrecurring))
+
+rm(groups, reg_learn_data, reg_valid_data)
+```
+
+
+Algorytm wyboru najlepszego drzewa regresyjnego, przewidującego wartość transakcji będzie analogiczny do pierwszego zadania.
+W pierwszej kolejności zbudowany zostanie model uwzględniający wszystkie moźliwe predyktory. Operacja ta ma u celu sporządzenie rankignu ważności predyktorów, które użyte zostaną prze konstrukcji najlepszego możliwego drzewa.
+
+Ważność predyktórów w przypadku drzew regresyjnych definiuje się nieco inaczej. W tym wypadku jest to  łączne zmniejszenie sumy kwadratów w wyniku zastosowania danej zmiennej (suma spadku sumy kwadratów z węzłów, w których dana zmienna występowała jako zmienna podziału, plus spadek sumy kwadratów razy korekta zgodności z węzłów, w których dana zmienna występowała jako zmienna zastępcza).
+
+
+```{r}
+initial_model <- rpart(amount~., data = usefull_data_learn, control = rpart.control(cp = 0))
+
+index_min_cp <- which.min(initial_model$cptable[, "xerror"])
+std_err <- sum(initial_model$cptable[index_min_cp, c("xerror", "xstd")])
+opt_cp <- which(initial_model$cptable[, "xerror"] < std_err)[1]
+
+initial_model_p <- prune(initial_model, cp = initial_model$cptable[opt_cp, "CP"])
+
+knitr::kable(initial_model_p$variable.importance, caption = 'Ważność zmiennych')
+```
+
+
+
+Zmienne o największym znaczeniu predykcyjnym w przypadku drzewa regresyjnego to kolejno 'amount.init', 'listtype', 'acquirereconnectionmethon' oraz 'level.init' i 'level'. Reszta predyktorów osiąga zdecydowanie niższe wyniki i nie będzie brana pod uwagę w budowaniu modelu.
+
+Co do interpretacji wpyłuwu tych predyktórów można pokusić się o następujące stwierdzenia:
+
+
+- amount.init w przypadku transakcji na wyższe kwoty jest często liczone w setkach, jak nie tysiącach złotych. Dla transakcji o niższej wartości jest to często złotówka. Dlatego wartość transakcji inicjującej często wprost mówi o tym jaka będzie wartość transakcji rekurencyjnej.
+
+- listtype jest określeniem sektora w którym działa osoba zlecająca transakcję. W sposób oczywisty można podejrzewać że są sektory w których operuje się transakcjami na dużo wyższe kwoty, niż chociażby ECOMMERCE, które odpowiada w większości na transakcje o niskiej wartości.
+
+- level i level.init są właściwie dokładnie tym samym predyktorem. Aby to potwierdzić przeprowadzimy pewno dochodzenie:
+
+```{r}
+
+check <- summary(usefull_data_learn$level == usefull_data_learn$level.init)
+print(check)
+
+```
+W związku z tym, nie ma sensu używać dwa razy tego samego predyktora. Do przyszłych modeli użyty zostanie tylko predyktor level.
+
+- Ostatnim i niestety najtrudniejszym do interpretacji jest predyktor 'acquiredconnectionmethod', gdyż jest to zmienna czysto techniczna. Podejrzewamy że prawdopodobnie w przypadku transakcji wysokogotówkowych, sposób ustanowienia połączenia między klientem a systemem jest inny, być może lepiej zabezpieczony.
+
+
+Przyszedł więc czas na obliczenie pierwszego modelu. Wykorzystane do niego zostaną zmienne opisane powyżej. Początkowo współczynnik kontroli 'cp' zostanie ustalony na 0.
+
+### Model 1 z dobranymi zmiennymi przez współczynnik ważności
+
+```{r}
+tree_not_pruned = rpart(
+  formula = amount ~ amount.init+listtype+acquirerconnectionmethod+level,
+  data = usefull_data_learn,
+  control = rpart.control(cp = 0)
+)
+
+predicts_train <- predict(object = tree_not_pruned, newdata = usefull_data_learn)
+predicts_valid <- predict(object = tree_not_pruned, newdata = usefull_data_valid)
+
+MSE_1_train <- mean((usefull_data_learn$amount - predicts_train)^2)
+MSE_1_valid <- mean((usefull_data_valid$amount - predicts_valid)^2)
+
+cat('MSE_1_train', MSE_1_train, '\n')
+cat('MSE_1_valid', MSE_1_valid, '\n')
+
+plot(x = usefull_data_learn$amount, y = predicts_train)
+plot(x = usefull_data_valid$amount, y = predicts_valid)
+
+plot(tree_not_pruned)
+
+
+measures_regression.df <- data.frame(matrix(ncol = 1, nrow = 2))
+j=1
+rownames(measures_regression.df) <- c('MSE_train', 'MSE_valid')
+
+measures_regression.df[1,j] <- MSE_1_train
+measures_regression.df[2,j] <- MSE_1_valid
+colnames(measures_regression.df)[j] <- 'Not_pruned'
+j = j + 1
+
+```
+
+
+W przypadku modelu bez przycinania błąd średniokwadratowy(MSE) wyniósł (`r MSE_1_valid`). Po wykresie można sądzić że predykcja nie jest idealna. Wartości powinny skupiać się wokół prostej przechodzącej z punktu (0,0) do (2500,2500). Jednak obserwowany jest pewnego rodzaju rozrzut. Drzewo to również jest bardzo skomplikowane i nie nadaje się do zrozumiałego opisu.
+Zauważalne i co za tym idzie ciekawe jest to, że błąd średniokwadratowy jest zauważalnie mniejszy na zbiorze walidacyjnym niż na zbiorze testowym. Udało się więc prawdopodobnie uniknąć przeuczenia.
+Z racji że powyższy model nie podległ procesowi pruningu, postanowimyi tak zastosować przycinanie, aby sprawdzić potencjalne korzyści jakie możemy na tym zyskać. W tym przypadku utworzymy funkcję pruning i zastosujemy ją na wyliczonym wczesniej modelu.
+
+
+```{r}
+pruning <- function(tree) {
+  errors <- tree$cptable
+  tmp1 <- which.min(errors[, "xerror"])
+  tmp2 <- sum(errors[tmp1, c("xerror", "xstd")])
+  optimal<- which(errors[, "xerror"] < tmp2)[1]
+  
+  prune(tree, cp = errors[optimal, "CP"])
+}
+```
+
+
+```{r}
+pruned_tree = pruning(tree_not_pruned)
+
+predicts_pruned_train <- predict(object = pruned_tree, newdata = usefull_data_learn)
+predicts_pruned_valid <- predict(object = pruned_tree, newdata = usefull_data_valid)
+
+MSE_1_2_train <- mean((usefull_data_learn$amount - predicts_pruned_train)^2)
+MSE_1_2_valid <- mean((usefull_data_valid$amount - predicts_pruned_valid)^2)
+
+cat('MSE po pruningu na zbiorze treningowym', MSE_1_2_train, '\n')
+cat('MSE po pruningu na zbiorze walidacyjnym', MSE_1_2_valid)
+
+plot(x = usefull_data_valid$amount, y = predicts_pruned_valid)
+plot(pruned_tree)
+
+measures_regression.df[1,j] <- MSE_1_2_train
+measures_regression.df[2,j] <- MSE_1_2_valid
+colnames(measures_regression.df)[j] <- 'Pruned'
+j = j + 1
+
+```
+Przycinanie w tym wypadku nie przyniosło dobrego efektu. Wedle naszej opinii uogólniło model przez co rozpatruje on zbyt mało wariantów. Powoduje to zbyt mały wachlarz przedziałów zmiennej opisywanej i pociąga za sobą pogorszenie MSE (`r MSE_1_2_valid`). Optymalizacji modelu szukać należy zapewne pośród innych możliwych wzorów modeli.
+
+
+
+## Boosting
+
+Sytuacja ma się zupełnie podobnie jak w części pierwszej. Za pomocą operacji boostingu tworzy sie model optymalny poprzez rekurencyjne aktualizowanie wag na podstawie błedu predykcji. 
+Jak w każdym przypadku zaczniemy od stworzenia modelu pełnego tak, aby z móc wybrać z niego najbardziej optymalne zmienne opisujące.
+Początkowo liczba drzew określona zostanie na 30.
+
+
+```{r}
+tree_boosting <- gbm(amount ~ amount.init+listtype+level+acquirerconnectionmethod,
+                     data = usefull_data_learn,
+                     distribution = 'gaussian',
+                     n.trees = 100,
+                     interaction.depth = 5)
+
+predicts_boosted_train = predict(tree_boosting, newdata = usefull_data_learn, n.trees = 30)
+predicts_boosted_valid = predict(tree_boosting, newdata = usefull_data_valid, n.trees = 30)
+
+
+MSE_2_1_train = mean((predicts_boosted_train - usefull_data_learn$amount)^2)
+MSE_2_1_valid = mean((predicts_boosted_valid - usefull_data_valid$amount)^2)
+
+
+
+cat('MSE po boostingu na zbiorze treningowym', MSE_2_1_train, '\n')
+cat('MSE po boostingu na zbiorze walidacyjnym', MSE_2_1_valid)
+
+measures_regression.df[1,j] <- MSE_2_1_train
+measures_regression.df[2,j] <- MSE_2_1_valid
+colnames(measures_regression.df)[j] <- 'Boosting_1'
+j = j + 1
+
+```
+
+Po przeprowadzonym boostingu zauważyć można zdecydowaną poprawę MSE dla zbiorów walidacyjnego jak i testowego względem drzewa przyciętego, lecz w stosunku do drzewa nie przyciętego wyniki osiagnięte metodą boostingową pogorszyły się.
+
+Warto jednak zauważyć że ilość drzew użytych do boostingu jest dość mała. Sprawdzimy jak wyglądać będzie sytuacja gdy powiększymy ilość generowanych drzew, czyli również ilość aktualizacji wag. Dla tej potrzeby zbudujemy funkcję wyliczającą model o zadanych parametrach.
+
+
+
+```{r}
+boosting <- function(dataset, dataset2, n, inter) {
+  
+  temp_tree <- gbm(amount ~ amount.init+listtype+level+acquirerconnectionmethod,
+                     data = dataset,
+                     distribution = 'gaussian',
+                     n.trees = n,
+                     interaction.depth = inter)
+  
+  temp_pred_l = predict(temp_tree, newdata = dataset, n.trees = n)
+  temp_pred_v = predict(temp_tree, newdata = dataset2, n.trees = n)
+  
+  mse_1_temp = mean((temp_pred_l - dataset$amount)^2)
+  mse_2_temp = mean((temp_pred_v - dataset2$amount)^2)
+  
+  
+  cat('MSE train | n.trees =', n, 'depth =', inter,'|', mse_1_temp, '\n')
+  cat('MSE valid | n.trees =', n, 'depth =', inter,'|', mse_2_temp, '\n')
+  cat('------------------------------------------------------ \n')
+  
+  return(c(mse_1_temp, mse_2_temp))
+}
+
+```
+
+Najpierw spójrzmy jak sytuacja wyglądać będzie gdy zwiększać będziemy ilość drzew które zostaną wyliczone. Przyjmujemy w tym przypadku że każde drzewo ma mieć głębokość 5.
+
+```{r}
+mse_ntrees_increment_learn = c()
+mse_ntrees_increment_valid = c()
+
+for (i in seq(50, 500, 50)){
+  my_vec = boosting(usefull_data_learn, usefull_data_valid, i , 5)
+  mse_ntrees_increment_learn <- append(mse_ntrees_increment_learn, my_vec[1])
+  mse_ntrees_increment_valid <- append(mse_ntrees_increment_valid, my_vec[2])
+}
+```
+
+
+```{r}
+range = seq(50,500,50)
+
+plot(range, mse_ntrees_increment_learn, type='l', col='red', ylab = 'MSE', ylim = c(4000, 7000))
+lines(range, mse_ntrees_increment_valid, col='green')
+legend('topright', legend = c('MSE Learn', 'MSE Valid'), col = c('red', 'green'), pch=1)
+```
+
+
+Jak widzimy, dla stałej wartości głębokości drzewa, wynik średniego błędu kwadratowego stabilizuje się mniej więcej na wysokości 300 drzew. Dalsze powiększanie zasobu zmniejsza błąd na zbiorze uczącym, ale nie zmniejsza na zbiorze walidacyjnym. Nie ma sensu powiększać modelu, gdyż doprowadzić to może co najwyżej do przeuczenia modelu.
+
+
+Teraz zastanowimy się jak wpłynie zmienianie głębokości poszczególnych drzew na wyniki MSE, przy zachowaniu ilości generowanych drzew.
+
+```{r}
+mse_depth_increment_learn = c()
+mse_depth_increment_valid = c()
+for (i in 1:10){
+  my_vec_depth = boosting(usefull_data_learn, usefull_data_valid, 300 , i)
+  mse_depth_increment_learn <- append(mse_depth_increment_learn, my_vec_depth[1])
+  mse_depth_increment_valid <- append(mse_depth_increment_valid, my_vec_depth[2])
+}
+```
+
+
+
+```{r}
+range = seq(1,10)
+
+plot(range, mse_depth_increment_learn, type='l', col='red', ylab = 'MSE', ylim = c(4000, 7000))
+lines(range, mse_depth_increment_valid, col='green')
+legend('topright', legend = c('MSE Learn', 'MSE Valid'), col = c('red', 'green'), pch=1)
+```
+
+Podobnie jak w przypadku ilości drzew, widać pewien punkt odcięcia poza którym pogłębianie drzew bazowych nie ma większego sensu. W tym przypadku wydaje się że jest to głębokość mniej więcej 6. 
+
+Oczywiśćie nie powiedziane jest że kombinacja typu depth=6 oraz ntrees=300 jest najbardziej optymalna. Co więcej ze sporą dawka pewności można podejrzewać że nie jest, ale dla zaoszczędzenia mocy obliczeniowej decydujemy się nie sprawdzać wszystkich możliwych kombinacji. Do naszego projektu przyjmujemy model w boostingowy w którym wyliczamy 300 drzew o głębokości 6.
+
+```{r}
+tree_boosting <- gbm(amount ~ amount.init+listtype+level+acquirerconnectionmethod,
+                     data = usefull_data_learn,
+                     distribution = 'gaussian',
+                     n.trees = 300,
+                     interaction.depth = 6)
+
+predicts_boosted_train = predict(tree_boosting, newdata = usefull_data_learn, n.trees = 300)
+predicts_boosted_valid = predict(tree_boosting, newdata = usefull_data_valid, n.trees = 300)
+
+
+MSE_2_2_train = mean((predicts_boosted_train - usefull_data_learn$amount)^2)
+MSE_2_2_valid = mean((predicts_boosted_valid - usefull_data_valid$amount)^2)
+
+
+
+cat('MSE po boostingu na zbiorze treningowym', MSE_2_2_train, '\n')
+cat('MSE po boostingu na zbiorze walidacyjnym', MSE_2_2_valid)
+
+measures_regression.df[1,j] <- MSE_2_2_train
+measures_regression.df[2,j] <- MSE_2_2_valid
+colnames(measures_regression.df)[j] <- 'Boosting_complete'
+j = j + 1
+```
+
+Wychodzi więc na to, że model boostingowy pokonuje model bazowy bez przycinania. Zarówno na polu błędu na zbiorze bazowym, jak i błędu na zbiorze walidacyjnym.
+
+
+## MARS
+Są to modele w których pokładamy dość spore nadzieje, gdyż są one w zasadzie przeznaczone dla problemu regresji.
+
+Modele mars w swojej charakterystyce są samodzielnie optymalizujące, z tego powodu w tym przypadku porzucimy wybrane wcześniej zmienne na podstawie ważności i zaczniemy od modelu pełnego.
+
+
+Ponieważ dane nie mogą zawierać NA-nów, w pierwszej kolejności pozbędziemy się zmiennych które w znacznym stopniu składają się z braków danych. A w kolumnach w których wartości NA występują w liczbie symbolicznej, usuniemy tylko niepotrzebne wiersze.
+
+
+
+```{r}
+cat('Zbiór uczący', '|', 'zbiór walidacyjny \n \n')
+for(i in 1:ncol(usefull_data_learn)) {
+  nans_learn <- sum(is.na(usefull_data_learn[, i]))
+  nans_valid<- sum(is.na(usefull_data_valid[, i]))
+  cat(colnames(usefull_data_learn)[i], nans_learn,'    |   ', colnames(usefull_data_valid)[i], nans_valid,'\n')
+}
+```
+Nasz zbiór składa się tylko z kolum które zawierają dużą ilość NaNów. Nie występują kolumny które zawierają nanów tylko kilka. Usuniemy teraz te kolumny które owe Nany zawierają, zarówno w zbiorze uczącym jak i walidacyjnym.
+
+```{r}
+clear_learn <- usefull_data_learn %>% select_if(~ !any(is.na(.)))
+clear_valid <- usefull_data_valid %>% select_if(~ !any(is.na(.)))
+```
+
+
+```{r}
+mars_0 <- earth(amount ~ .,
+               data = clear_learn)
+summary(mars_0)
+
+```
+
+Interpretacje takiego modelu można rozumieć kolejno :
+
+Dla zmiennych kategorycznych:
+
+- wraz ze zmianą klasy z klasy referencyjnej dla danej zmiennej na klasę podaną w podsumowaniu, wartość zmiennej amount zmienia się o wartośc współczynnika, ceteris paribus. Na przykałd:
+
+- - acquirerconnectionmethodFDP_SOAP        -26.228 czyli zmiana klasy acquirerconnectionmethod z klasy bazowej, na klase FDP_SOAP zmienia wartośc amount o -26.228
+
+Dla zmiennych ilościowych:
+
+- jeśli wartość zmiennej zawiera się w pewnym przedziale, wartość amouny zmienia się o dany współczynnik. Na przykład:
+
+- -h(amount.init-4.08)   48.005 h(amount.init-18.88)    -10.73 czyli jesli amount.init jest mniejsza od 4.08, to wartość amount rośnie o 48.005. Jeśli jest mniejsza od 18.88 to maleje o -10.73.
+
+
+Miarę dokładności za pomocą wspołczynnika gcv, czyli generalizowanej cross-walidacji. Warto przyjrzeć się wykresom diagnostycznym.
+
+```{r}
+plot(mars_0, info= 1)
+```
+
+Ewidentnie model należy niedelikatnie polepszyć poprzez kontrole parametrów oraz dodawanie ewentualnych interakcji.
+
+```{r}
+mars_1 <- earth(
+  amount ~ .,  
+  data = clear_learn,
+  degree = 2
+)
+```
+```{r}
+cat('gcv = ', mars_1$gcv)
+```
+
+W przypadku dodania interakcji 2 stopnia, widać ewidentną poprawę współczynnika gcv. 
+Przeprowadzimy teraz sprawdzenie na 30 różnych kombinacjach hiperparametrów jak najlepiej wyspecyfikować model. Do tego posłużymy się biblioteką caret. Dobór odbędzie się na podstawie pierwiastka błędu średniokwadratowego.
+
+*Mała poprawka. Miało być 30, lecz czas potrzebny na obliczenie takiej ilosci tak skomoplikowanych modeli jest zbyt długi aby sensownie na niego czekać. W zwiazku z tym ograniczymy nasz wybór do 10 modeli*
+
+```{r}
+grid_parameters <- expand.grid(
+  degree = 1:2, 
+  nprune = floor(seq(2, 50, length.out = 10))
+  )
+
+tuned_model_mars<- train(
+  x = clear_learn %>% dplyr::select(-c(amount)),
+  y = clear_learn$amount,
+  method = "earth",
+  metric = "RMSE",
+  trControl = trainControl(method = "cv", number = 10),
+  tuneGrid = grid_parameters
+)
+
+```
+Najlepszy model kształtuje się następująco
+```{r}
+tuned_model_mars$bestTune
+```
+Znajdowanie tego typu najbardziej optymalnych modeli jest dość sporym wyzwaniem. Powyższy kawałek kodu kompilował się prawie godzinę. W sytuacji gdy chcielibyśmy znaleźć modele z jeszcze większym stopniem interakcji, prawdopodobnie tego typu działanie wymagałoby od nas użycia technologii chmurowych.
+
+Możemy również spojrzeć jak wyglądały poszczególne modele pod wzgedem crosswalidacji.
+
+```{r}
+ggplot(tuned_model_mars )
+
+```
+
+Na podstawie powyższych wyników, możemy byc pewni, że modele z uwzględnieniem pojedynczej korelacji nie byłyby zbyt zadowalające.
+
+Spójrzmy jeszcze na gcv naszego modelu:
+
+```{r}
+summary(tuned_model_mars)
+```
+
+Co ciekawe tego typu operacja nie polepszyła współczynnika gcv. Prawdopodobnie najbardziej optymalne rozwiązanie kryje się pod częścią tuningu której nie objęła nasza moc obliczeniowa.
+
+Można pokusić się jeszcze o sprawdzenie ważności predyktorów.
+
+```{r}
+library(vip)
+importance_plot_gcv <- vip::vip(tuned_model_mars, num_features = 20, bar = FALSE, value = "gcv") +
+  ggtitle("GCV")
+importance_plot_rss <- vip(tuned_model_mars, num_features = 20, bar = FALSE, value = "rss") +
+  ggtitle("RSS")
+print(importance_plot_gcv)
+print(importance_plot_rss)
+```
+
+Jak widać niezależnie od wyboru parametru względem ktorego wybierane sa najważniejsze zmienne, wybór jest dokładnie taki sam. Zmienne również pokrywają się z tymi, które wyznaczyliśmy przy okazji robienia pierwszego drzewa w tej części projektu.
+
+MSE wyliczonego przez nas modelu kształtuje się następująco
+
+```{r}
+
+predicts_mars_learn = predict(tuned_model_mars, newdata = clear_learn)
+predicts_mars_valid = predict(tuned_model_mars, newdata = clear_valid)
+
+MSE_3_1_train = mean((predicts_mars_learn - clear_learn$amount)^2)
+MSE_3_1_valid = mean((predicts_mars_valid - clear_valid$amount)^2)
+
+cat('MSE modelu MARS na zbiorze treningowym', MSE_3_1_train, '\n')
+cat('MSE modelu MARS na zbiorze walidacyjnym', MSE_3_1_valid)
+
+measures_regression.df[1,j] <- MSE_3_1_train
+measures_regression.df[2,j] <- MSE_3_1_valid
+colnames(measures_regression.df)[j] <- 'mars_tuned'
+j = j + 1
+
+```
+
+
+
+Ostatecznie zestawić można nasze wyniki poszczególnych podejść w następującej tabeli.
+
+```{r}
+knitr::kable(round(measures_regression.df, 3), caption = 'Zestawienie poszczególnych miar dla zbudowanych modeli')
+```
+
+
+
+Jak widać i w tym przypadku najlepszym modelem jaki udało nam się wyspecyfikować jest model boostingowy. Z pewnością nie jest to model najbardziej optymalny. Uważamy że bardzo duży potencjał leży w dostosowywaniu modeli MARS, lecz czas potrzebny do wyspecyfikowania optymalnego modelu jest na tyle relatywnie duży, że porzuciliśmy pomysł dalszego tuningowania modelu.
+
+
+## Predykcje zbioru testowego
+
+Do predykcji zbioru testowego użyjemy modelu boostingowego. Nasz wybór pada na niego gdyż jest to najlepszy model jaki udało nam się wyspecyfikować. 
+
+
+Poniżej znajduje się skrypt dodający predykcje do tabeli 'predykcje_testowa'
+
+```{r}
+usefull_data_test <- recur_test %>% dplyr::select(-c(isrecurring))
+
+predicts_boosted_test= predict(tree_boosting, newdata = usefull_data_test, n.trees = 300)
+
+usefull_data_test$amount = predicts_boosted_test
+
+
+if (sum(sort(usefull_data_test$id) == sort(predykcje_testowa$id)) == length(predykcje_testowa$id)){
+  
+  predykcje_testowa <- merge(usefull_data_test, predykcje_testowa, by = 'id') %>%
+    dplyr::select(c('id', 'amount.x', 'status')) 
+}
+
+colnames(predykcje_testowa)[2] <- 'amount'
+                                                  
+
+saveRDS(predykcje_testowa, 'predykcje_testowa.RData')
+```
+
+
